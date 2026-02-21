@@ -1,6 +1,6 @@
 use crate::config::schema::{
-    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NostrConfig,
-    QQConfig, StreamMode, WhatsAppConfig,
+    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
+    NextcloudTalkConfig, NostrConfig, QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -62,43 +62,16 @@ const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
-    let ChannelsConfig {
-        cli: _,     // `cli` is always available and does not require channel server startup
-        webhook: _, // webhook traffic is handled by gateway, not `zeroclaw channel start`
-        telegram,
-        discord,
-        slack,
-        mattermost,
-        imessage,
-        matrix,
-        signal,
-        whatsapp,
-        email,
-        irc,
-        lark,
-        dingtalk,
-        linq,
-        qq,
-        ..
-    } = channels;
-
-    telegram.is_some()
-        || discord.is_some()
-        || slack.is_some()
-        || mattermost.is_some()
-        || imessage.is_some()
-        || matrix.is_some()
-        || signal.is_some()
-        || whatsapp.is_some()
-        || email.is_some()
-        || irc.is_some()
-        || lark.is_some()
-        || dingtalk.is_some()
-        || linq.is_some()
-        || qq.is_some()
+    channels.channels_except_webhook().iter().any(|(_, ok)| *ok)
 }
 
 // ── Main wizard entry point ──────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveOnboardingMode {
+    FullOnboarding,
+    UpdateProviderOnly,
+}
 
 pub async fn run_wizard(force: bool) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
@@ -117,7 +90,12 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
 
     print_step(1, 9, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace().await?;
-    ensure_onboard_overwrite_allowed(&config_path, force)?;
+    match resolve_interactive_onboarding_mode(&config_path, force)? {
+        InteractiveOnboardingMode::FullOnboarding => {}
+        InteractiveOnboardingMode::UpdateProviderOnly => {
+            return run_provider_update_wizard(&workspace_dir, &config_path).await;
+        }
+    }
 
     print_step(2, 9, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
@@ -159,6 +137,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         default_temperature: 0.7,
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
+        security: crate::config::SecurityConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
@@ -288,6 +267,85 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     Ok(config)
 }
 
+/// Interactive flow: update only provider/model/api key while preserving existing config.
+async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) -> Result<Config> {
+    println!();
+    println!(
+        "  {} Existing config detected. Running provider-only update mode (preserving channels, memory, tunnel, hooks, and other settings).",
+        style("↻").cyan().bold()
+    );
+
+    let raw = fs::read_to_string(config_path).await.with_context(|| {
+        format!(
+            "Failed to read existing config at {}",
+            config_path.display()
+        )
+    })?;
+    let mut config: Config = toml::from_str(&raw).with_context(|| {
+        format!(
+            "Failed to parse existing config at {}",
+            config_path.display()
+        )
+    })?;
+    config.workspace_dir = workspace_dir.to_path_buf();
+    config.config_path = config_path.to_path_buf();
+
+    print_step(1, 1, "AI Provider & API Key");
+    let (provider, api_key, model, provider_api_url) = setup_provider(workspace_dir).await?;
+    apply_provider_update(&mut config, provider, api_key, model, provider_api_url);
+
+    config.save().await?;
+    persist_workspace_selection(&config.config_path).await?;
+
+    println!(
+        "  {} Provider settings updated at {}",
+        style("✓").green().bold(),
+        style(config.config_path.display()).green()
+    );
+    print_summary(&config);
+
+    let has_channels = has_launchable_channels(&config.channels_config);
+    if has_channels && config.api_key.is_some() {
+        let launch: bool = Confirm::new()
+            .with_prompt(format!(
+                "  {} Launch channels now? (connected channels → AI → reply)",
+                style("🚀").cyan()
+            ))
+            .default(true)
+            .interact()?;
+
+        if launch {
+            println!();
+            println!(
+                "  {} {}",
+                style("⚡").cyan(),
+                style("Starting channel server...").white().bold()
+            );
+            println!();
+            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+        }
+    }
+
+    Ok(config)
+}
+
+fn apply_provider_update(
+    config: &mut Config,
+    provider: String,
+    api_key: String,
+    model: String,
+    provider_api_url: Option<String>,
+) {
+    config.default_provider = Some(provider);
+    config.default_model = Some(model);
+    config.api_url = provider_api_url;
+    config.api_key = if api_key.trim().is_empty() {
+        None
+    } else {
+        Some(api_key)
+    };
+}
+
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
@@ -354,6 +412,28 @@ pub async fn run_quick_setup(
     .await
 }
 
+fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
+    if let Ok(custom_config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        let trimmed = custom_config_dir.trim();
+        if !trimmed.is_empty() {
+            let config_dir = PathBuf::from(trimmed);
+            return (config_dir.clone(), config_dir.join("workspace"));
+        }
+    }
+
+    if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+        let trimmed = custom_workspace.trim();
+        if !trimmed.is_empty() {
+            return crate::config::schema::resolve_config_dir_for_workspace(&PathBuf::from(
+                trimmed,
+            ));
+        }
+    }
+
+    let config_dir = home.join(".zeroclaw");
+    (config_dir.clone(), config_dir.join("workspace"))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_quick_setup_with_home(
     credential_override: Option<&str>,
@@ -372,8 +452,7 @@ async fn run_quick_setup_with_home(
     );
     println!();
 
-    let zeroclaw_dir = home.join(".zeroclaw");
-    let workspace_dir = zeroclaw_dir.join("workspace");
+    let (zeroclaw_dir, workspace_dir) = resolve_quick_setup_dirs_with_home(home);
     let config_path = zeroclaw_dir.join("config.toml");
 
     ensure_onboard_overwrite_allowed(&config_path, force)?;
@@ -406,6 +485,7 @@ async fn run_quick_setup_with_home(
         default_temperature: 0.7,
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
+        security: crate::config::SecurityConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
@@ -557,7 +637,15 @@ fn canonical_provider_name(provider_name: &str) -> &str {
 fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "openrouter" | "ollama" | "llamacpp" | "vllm" | "osaurus" | "venice" | "astrai" | "nvidia"
+        "openrouter"
+            | "ollama"
+            | "llamacpp"
+            | "sglang"
+            | "vllm"
+            | "osaurus"
+            | "venice"
+            | "astrai"
+            | "nvidia"
     )
 }
 
@@ -591,7 +679,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
-        "vllm" | "osaurus" => "default".into(),
+        "sglang" | "vllm" | "osaurus" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -939,7 +1027,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Qwen2.5 Coder 7B GGUF (coding-focused)".to_string(),
             ),
         ],
-        "vllm" => vec![
+        "sglang" | "vllm" => vec![
             (
                 "meta-llama/Llama-3.1-8B-Instruct".to_string(),
                 "Llama 3.1 8B Instruct (popular, fast)".to_string(),
@@ -1021,6 +1109,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "gemini"
             | "ollama"
             | "llamacpp"
+            | "sglang"
             | "vllm"
             | "osaurus"
             | "astrai"
@@ -1059,6 +1148,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
+            "sglang" => Some("http://localhost:30000/v1/models"),
             "vllm" => Some("http://localhost:8000/v1/models"),
             "osaurus" => Some("http://localhost:1337/v1/models"),
             _ => None,
@@ -1293,7 +1383,7 @@ fn resolve_live_models_endpoint(
 ) -> Option<String> {
     if matches!(
         canonical_provider_name(provider_name),
-        "llamacpp" | "vllm" | "osaurus"
+        "llamacpp" | "sglang" | "vllm" | "osaurus"
     ) {
         if let Some(url) = provider_api_url
             .map(str::trim)
@@ -1667,6 +1757,52 @@ fn print_bullet(text: &str) {
     println!("  {} {}", style("›").cyan(), text);
 }
 
+fn resolve_interactive_onboarding_mode(
+    config_path: &Path,
+    force: bool,
+) -> Result<InteractiveOnboardingMode> {
+    if !config_path.exists() {
+        return Ok(InteractiveOnboardingMode::FullOnboarding);
+    }
+
+    if force {
+        println!(
+            "  {} Existing config detected at {}. Proceeding with full onboarding because --force was provided.",
+            style("!").yellow().bold(),
+            style(config_path.display()).yellow()
+        );
+        return Ok(InteractiveOnboardingMode::FullOnboarding);
+    }
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!(
+            "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
+            config_path.display()
+        );
+    }
+
+    let options = [
+        "Full onboarding (overwrite config.toml)",
+        "Update AI provider/model/API key only (preserve existing configuration)",
+        "Cancel",
+    ];
+
+    let mode = Select::new()
+        .with_prompt(format!(
+            "  Existing config found at {}. Select setup mode",
+            config_path.display()
+        ))
+        .items(&options)
+        .default(1)
+        .interact()?;
+
+    match mode {
+        0 => Ok(InteractiveOnboardingMode::FullOnboarding),
+        1 => Ok(InteractiveOnboardingMode::UpdateProviderOnly),
+        _ => bail!("Onboarding canceled: existing configuration was left unchanged."),
+    }
+}
+
 fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<()> {
     if !config_path.exists() {
         return Ok(());
@@ -1720,14 +1856,12 @@ async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
 // ── Step 1: Workspace ────────────────────────────────────────────
 
 async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
-    let default_dir = home.join(".zeroclaw");
+    let (default_config_dir, default_workspace_dir) =
+        crate::config::schema::resolve_runtime_dirs_for_onboarding().await?;
 
     print_bullet(&format!(
         "Default location: {}",
-        style(default_dir.display()).green()
+        style(default_workspace_dir.display()).green()
     ));
 
     let use_default = Confirm::new()
@@ -1735,18 +1869,17 @@ async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
         .default(true)
         .interact()?;
 
-    let zeroclaw_dir = if use_default {
-        default_dir
+    let (config_dir, workspace_dir) = if use_default {
+        (default_config_dir, default_workspace_dir)
     } else {
         let custom: String = Input::new()
             .with_prompt("  Enter workspace path")
             .interact_text()?;
         let expanded = shellexpand::tilde(&custom).to_string();
-        PathBuf::from(expanded)
+        crate::config::schema::resolve_config_dir_for_workspace(&PathBuf::from(expanded))
     };
 
-    let workspace_dir = zeroclaw_dir.join("workspace");
-    let config_path = zeroclaw_dir.join("config.toml");
+    let config_path = config_dir.join("config.toml");
 
     fs::create_dir_all(&workspace_dir)
         .await
@@ -1849,18 +1982,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
         ],
-        4 => vec![
-            ("ollama", "Ollama — local models (Llama, Mistral, Phi)"),
-            (
-                "llamacpp",
-                "llama.cpp server — local OpenAI-compatible endpoint",
-            ),
-            ("vllm", "vLLM — high-performance local inference engine"),
-            (
-                "osaurus",
-                "Osaurus — unified AI edge runtime (local MLX + cloud proxy + MCP)",
-            ),
-        ],
+        4 => local_provider_choices(),
         _ => vec![], // Custom — handled below
     };
 
@@ -1999,6 +2121,37 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             print_bullet(&format!(
                 "No API key provided. Set {} later only if your server requires authentication.",
                 style("LLAMACPP_API_KEY").yellow()
+            ));
+        }
+
+        key
+    } else if provider_name == "sglang" {
+        let raw_url: String = Input::new()
+            .with_prompt("  SGLang server endpoint URL")
+            .default("http://localhost:30000/v1".into())
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("SGLang endpoint URL cannot be empty.");
+        }
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Using SGLang server endpoint: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet("No API key needed unless your SGLang server requires authentication.");
+
+        let key: String = Input::new()
+            .with_prompt("  API key for SGLang server (or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(&format!(
+                "No API key provided. Set {} later only if your server requires authentication.",
+                style("SGLANG_API_KEY").yellow()
             ));
         }
 
@@ -2457,6 +2610,25 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     Ok((provider_name.to_string(), api_key, model, provider_api_url))
 }
 
+fn local_provider_choices() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("ollama", "Ollama — local models (Llama, Mistral, Phi)"),
+        (
+            "llamacpp",
+            "llama.cpp server — local OpenAI-compatible endpoint",
+        ),
+        (
+            "sglang",
+            "SGLang — high-performance local serving framework",
+        ),
+        ("vllm", "vLLM — high-performance local inference engine"),
+        (
+            "osaurus",
+            "Osaurus — unified AI edge runtime (local MLX + cloud proxy + MCP)",
+        ),
+    ]
+}
+
 /// Map provider name to its conventional env var
 fn provider_env_var(name: &str) -> &'static str {
     if canonical_provider_name(name) == "qwen-code" {
@@ -2469,6 +2641,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "openai" => "OPENAI_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
+        "sglang" => "SGLANG_API_KEY",
         "vllm" => "VLLM_API_KEY",
         "osaurus" => "OSAURUS_API_KEY",
         "venice" => "VENICE_API_KEY",
@@ -2502,7 +2675,7 @@ fn provider_env_var(name: &str) -> &'static str {
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "ollama" | "llamacpp" | "vllm" | "osaurus"
+        "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus"
     )
 }
 
@@ -2923,6 +3096,49 @@ fn setup_memory() -> Result<MemoryConfig> {
 
 // ── Step 3: Channels ────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelMenuChoice {
+    Telegram,
+    Discord,
+    Slack,
+    IMessage,
+    Matrix,
+    Signal,
+    WhatsApp,
+    Linq,
+    Irc,
+    Webhook,
+    NextcloudTalk,
+    DingTalk,
+    QqOfficial,
+    LarkFeishu,
+    Nostr,
+    Done,
+}
+
+const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
+    ChannelMenuChoice::Telegram,
+    ChannelMenuChoice::Discord,
+    ChannelMenuChoice::Slack,
+    ChannelMenuChoice::IMessage,
+    ChannelMenuChoice::Matrix,
+    ChannelMenuChoice::Signal,
+    ChannelMenuChoice::WhatsApp,
+    ChannelMenuChoice::Linq,
+    ChannelMenuChoice::Irc,
+    ChannelMenuChoice::Webhook,
+    ChannelMenuChoice::NextcloudTalk,
+    ChannelMenuChoice::DingTalk,
+    ChannelMenuChoice::QqOfficial,
+    ChannelMenuChoice::LarkFeishu,
+    ChannelMenuChoice::Nostr,
+    ChannelMenuChoice::Done,
+];
+
+fn channel_menu_choices() -> &'static [ChannelMenuChoice] {
+    CHANNEL_MENU_CHOICES
+}
+
 #[allow(clippy::too_many_lines)]
 fn setup_channels() -> Result<ChannelsConfig> {
     print_bullet("Channels let you talk to ZeroClaw from anywhere.");
@@ -2930,39 +3146,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
     println!();
 
     let mut config = ChannelsConfig::default();
-    #[derive(Clone, Copy)]
-    enum ChannelMenuChoice {
-        Telegram,
-        Discord,
-        Slack,
-        IMessage,
-        Matrix,
-        WhatsApp,
-        Linq,
-        Irc,
-        Webhook,
-        DingTalk,
-        QqOfficial,
-        LarkFeishu,
-        Nostr,
-        Done,
-    }
-    let menu_choices = [
-        ChannelMenuChoice::Telegram,
-        ChannelMenuChoice::Discord,
-        ChannelMenuChoice::Slack,
-        ChannelMenuChoice::IMessage,
-        ChannelMenuChoice::Matrix,
-        ChannelMenuChoice::WhatsApp,
-        ChannelMenuChoice::Linq,
-        ChannelMenuChoice::Irc,
-        ChannelMenuChoice::Webhook,
-        ChannelMenuChoice::DingTalk,
-        ChannelMenuChoice::QqOfficial,
-        ChannelMenuChoice::LarkFeishu,
-        ChannelMenuChoice::Nostr,
-        ChannelMenuChoice::Done,
-    ];
+    let menu_choices = channel_menu_choices();
 
     loop {
         let options: Vec<String> = menu_choices
@@ -3008,6 +3192,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "— self-hosted chat"
                     }
                 ),
+                ChannelMenuChoice::Signal => format!(
+                    "Signal     {}",
+                    if config.signal.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— signal-cli daemon bridge"
+                    }
+                ),
                 ChannelMenuChoice::WhatsApp => format!(
                     "WhatsApp   {}",
                     if config.whatsapp.is_some() {
@@ -3038,6 +3230,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "✅ configured"
                     } else {
                         "— HTTP endpoint"
+                    }
+                ),
+                ChannelMenuChoice::NextcloudTalk => format!(
+                    "Nextcloud  {}",
+                    if config.nextcloud_talk.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— Talk webhook + OCS API"
                     }
                 ),
                 ChannelMenuChoice::DingTalk => format!(
@@ -3568,6 +3768,102 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
+            ChannelMenuChoice::Signal => {
+                // ── Signal ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Signal Setup").white().bold(),
+                    style("— signal-cli daemon bridge").dim()
+                );
+                print_bullet("1. Run signal-cli daemon with HTTP enabled (default port 8686).");
+                print_bullet("2. Ensure your Signal account is registered in signal-cli.");
+                print_bullet("3. Optionally scope to DMs only or to a specific group.");
+                println!();
+
+                let http_url: String = Input::new()
+                    .with_prompt("  signal-cli HTTP URL")
+                    .default("http://127.0.0.1:8686".into())
+                    .interact_text()?;
+
+                if http_url.trim().is_empty() {
+                    println!("  {} Skipped — HTTP URL required", style("→").dim());
+                    continue;
+                }
+
+                let account: String = Input::new()
+                    .with_prompt("  Account number (E.164, e.g. +1234567890)")
+                    .interact_text()?;
+
+                if account.trim().is_empty() {
+                    println!("  {} Skipped — account number required", style("→").dim());
+                    continue;
+                }
+
+                let scope_options = [
+                    "All messages (DMs + groups)",
+                    "DM only",
+                    "Specific group ID",
+                ];
+                let scope_choice = Select::new()
+                    .with_prompt("  Message scope")
+                    .items(scope_options)
+                    .default(0)
+                    .interact()?;
+
+                let group_id = match scope_choice {
+                    1 => Some("dm".to_string()),
+                    2 => {
+                        let group_input: String =
+                            Input::new().with_prompt("  Group ID").interact_text()?;
+                        let group_input = group_input.trim().to_string();
+                        if group_input.is_empty() {
+                            println!("  {} Skipped — group ID required", style("→").dim());
+                            continue;
+                        }
+                        Some(group_input)
+                    }
+                    _ => None,
+                };
+
+                let allowed_from_raw: String = Input::new()
+                    .with_prompt(
+                        "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
+                    )
+                    .default("*".into())
+                    .interact_text()?;
+
+                let allowed_from = if allowed_from_raw.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    allowed_from_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                let ignore_attachments = Confirm::new()
+                    .with_prompt("  Ignore attachment-only messages?")
+                    .default(false)
+                    .interact()?;
+
+                let ignore_stories = Confirm::new()
+                    .with_prompt("  Ignore incoming stories?")
+                    .default(true)
+                    .interact()?;
+
+                config.signal = Some(SignalConfig {
+                    http_url: http_url.trim_end_matches('/').to_string(),
+                    account: account.trim().to_string(),
+                    group_id,
+                    allowed_from,
+                    ignore_attachments,
+                    ignore_stories,
+                });
+
+                println!("  {} Signal configured", style("✅").green().bold());
+            }
             ChannelMenuChoice::WhatsApp => {
                 // ── WhatsApp ──
                 println!();
@@ -4011,6 +4307,73 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style(&port).cyan()
                 );
             }
+            ChannelMenuChoice::NextcloudTalk => {
+                // ── Nextcloud Talk ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Nextcloud Talk Setup").white().bold(),
+                    style("— Talk webhook receive + OCS API send").dim()
+                );
+                print_bullet("1. Configure your Nextcloud Talk bot app and app token.");
+                print_bullet("2. Set webhook URL to: https://<your-public-url>/nextcloud-talk");
+                print_bullet(
+                    "3. Keep webhook_secret aligned with Nextcloud signature headers if enabled.",
+                );
+                println!();
+
+                let base_url: String = Input::new()
+                    .with_prompt("  Nextcloud base URL (e.g. https://cloud.example.com)")
+                    .interact_text()?;
+
+                let base_url = base_url.trim().trim_end_matches('/').to_string();
+                if base_url.is_empty() {
+                    println!("  {} Skipped — base URL required", style("→").dim());
+                    continue;
+                }
+
+                let app_token: String = Input::new()
+                    .with_prompt("  App token (Talk bot token)")
+                    .interact_text()?;
+
+                if app_token.trim().is_empty() {
+                    println!("  {} Skipped — app token required", style("→").dim());
+                    continue;
+                }
+
+                let webhook_secret: String = Input::new()
+                    .with_prompt("  Webhook secret (optional, Enter to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users_raw: String = Input::new()
+                    .with_prompt("  Allowed Nextcloud actor IDs (comma-separated, or * for all)")
+                    .default("*".into())
+                    .interact_text()?;
+
+                let allowed_users = if allowed_users_raw.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    allowed_users_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                config.nextcloud_talk = Some(NextcloudTalkConfig {
+                    base_url,
+                    app_token: app_token.trim().to_string(),
+                    webhook_secret: if webhook_secret.trim().is_empty() {
+                        None
+                    } else {
+                        Some(webhook_secret.trim().to_string())
+                    },
+                    allowed_users,
+                });
+
+                println!("  {} Nextcloud Talk configured", style("✅").green().bold());
+            }
             ChannelMenuChoice::DingTalk => {
                 // ── DingTalk ──
                 println!();
@@ -4438,54 +4801,17 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
 
     // Summary line
-    let mut active: Vec<&str> = vec!["CLI"];
-    if config.telegram.is_some() {
-        active.push("Telegram");
-    }
-    if config.discord.is_some() {
-        active.push("Discord");
-    }
-    if config.slack.is_some() {
-        active.push("Slack");
-    }
-    if config.imessage.is_some() {
-        active.push("iMessage");
-    }
-    if config.matrix.is_some() {
-        active.push("Matrix");
-    }
-    if config.whatsapp.is_some() {
-        active.push("WhatsApp");
-    }
-    if config.linq.is_some() {
-        active.push("Linq");
-    }
-    if config.email.is_some() {
-        active.push("Email");
-    }
-    if config.irc.is_some() {
-        active.push("IRC");
-    }
-    if config.webhook.is_some() {
-        active.push("Webhook");
-    }
-    if config.dingtalk.is_some() {
-        active.push("DingTalk");
-    }
-    if config.qq.is_some() {
-        active.push("QQ");
-    }
-    if config.lark.is_some() {
-        active.push("Lark");
-    }
-    if config.nostr.is_some() {
-        active.push("Nostr");
-    }
+    let channels = config.channels();
+    let channels = channels
+        .iter()
+        .filter_map(|(channel, ok)| ok.then_some(channel.name()));
+    let channels: Vec<_> = std::iter::once("Cli").chain(channels).collect();
+    let active = channels.join(", ");
 
     println!(
         "  {} Channels: {}",
         style("✓").green().bold(),
-        style(active.join(", ")).green()
+        style(active).green()
     );
 
     Ok(config)
@@ -4974,31 +5300,12 @@ fn print_summary(config: &Config) {
     );
 
     // Channels summary
-    let mut channels: Vec<&str> = vec!["CLI"];
-    if config.channels_config.telegram.is_some() {
-        channels.push("Telegram");
-    }
-    if config.channels_config.discord.is_some() {
-        channels.push("Discord");
-    }
-    if config.channels_config.slack.is_some() {
-        channels.push("Slack");
-    }
-    if config.channels_config.imessage.is_some() {
-        channels.push("iMessage");
-    }
-    if config.channels_config.matrix.is_some() {
-        channels.push("Matrix");
-    }
-    if config.channels_config.email.is_some() {
-        channels.push("Email");
-    }
-    if config.channels_config.webhook.is_some() {
-        channels.push("Webhook");
-    }
-    if config.channels_config.lark.is_some() {
-        channels.push("Lark");
-    }
+    let channels = config.channels_config.channels();
+    let channels = channels
+        .iter()
+        .filter_map(|(channel, ok)| ok.then_some(channel.name()));
+    let channels: Vec<_> = std::iter::once("Cli").chain(channels).collect();
+
     println!(
         "    {} Channels:      {}",
         style("📡").cyan(),
@@ -5185,7 +5492,42 @@ fn print_summary(config: &Config) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     // ── ProjectContext defaults ──────────────────────────────────
 
@@ -5196,6 +5538,57 @@ mod tests {
         assert!(ctx.timezone.is_empty());
         assert!(ctx.agent_name.is_empty());
         assert!(ctx.communication_style.is_empty());
+    }
+
+    #[test]
+    fn apply_provider_update_preserves_non_provider_settings() {
+        let mut config = Config::default();
+        config.default_temperature = 1.23;
+        config.memory.backend = "markdown".to_string();
+        config.skills.open_skills_enabled = true;
+        config.channels_config.cli = false;
+
+        apply_provider_update(
+            &mut config,
+            "openrouter".to_string(),
+            "sk-updated".to_string(),
+            "openai/gpt-5.2".to_string(),
+            Some("https://openrouter.ai/api/v1".to_string()),
+        );
+
+        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
+        assert_eq!(config.default_model.as_deref(), Some("openai/gpt-5.2"));
+        assert_eq!(config.api_key.as_deref(), Some("sk-updated"));
+        assert_eq!(
+            config.api_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(config.default_temperature, 1.23);
+        assert_eq!(config.memory.backend, "markdown");
+        assert!(config.skills.open_skills_enabled);
+        assert!(!config.channels_config.cli);
+    }
+
+    #[test]
+    fn apply_provider_update_clears_api_key_when_empty() {
+        let mut config = Config::default();
+        config.api_key = Some("sk-old".to_string());
+
+        apply_provider_update(
+            &mut config,
+            "anthropic".to_string(),
+            "".to_string(),
+            "claude-sonnet-4-5-20250929".to_string(),
+            None,
+        );
+
+        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("claude-sonnet-4-5-20250929")
+        );
+        assert!(config.api_key.is_none());
+        assert!(config.api_url.is_none());
     }
 
     #[tokio::test]
@@ -5301,6 +5694,35 @@ mod tests {
         let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
         assert!(config_raw.contains("default_provider = \"openrouter\""));
         assert!(config_raw.contains("default_model = \"custom-model-fresh\""));
+    }
+
+    #[tokio::test]
+    async fn quick_setup_respects_zero_claw_workspace_env_layout() {
+        let _env_guard = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let workspace_root = tmp.path().join("zeroclaw-data");
+        let workspace_dir = workspace_root.join("workspace");
+        let expected_config_path = workspace_root.join(".zeroclaw").join("config.toml");
+
+        let _workspace_env = EnvVarGuard::set(
+            "ZEROCLAW_WORKSPACE",
+            workspace_dir.to_string_lossy().as_ref(),
+        );
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
+
+        let config = run_quick_setup_with_home(
+            Some("sk-env"),
+            Some("openrouter"),
+            Some("model-env"),
+            Some("sqlite"),
+            false,
+            tmp.path(),
+        )
+        .await
+        .expect("quick setup should honor ZEROCLAW_WORKSPACE");
+
+        assert_eq!(config.workspace_dir, workspace_dir);
+        assert_eq!(config.config_path, expected_config_path);
     }
 
     // ── scaffold_workspace: basic file creation ─────────────────
@@ -5812,6 +6234,7 @@ mod tests {
             default_model_for_provider("llamacpp"),
             "ggml-org/gpt-oss-20b-GGUF"
         );
+        assert_eq!(default_model_for_provider("sglang"), "default");
         assert_eq!(default_model_for_provider("vllm"), "default");
         assert_eq!(
             default_model_for_provider("astrai"),
@@ -5923,6 +6346,7 @@ mod tests {
         assert!(allows_unauthenticated_model_fetch("ollama"));
         assert!(allows_unauthenticated_model_fetch("llamacpp"));
         assert!(allows_unauthenticated_model_fetch("llama.cpp"));
+        assert!(allows_unauthenticated_model_fetch("sglang"));
         assert!(allows_unauthenticated_model_fetch("vllm"));
         assert!(!allows_unauthenticated_model_fetch("openai"));
         assert!(!allows_unauthenticated_model_fetch("deepseek"));
@@ -5965,6 +6389,7 @@ mod tests {
         assert!(supports_live_model_fetch("ollama"));
         assert!(supports_live_model_fetch("llamacpp"));
         assert!(supports_live_model_fetch("llama.cpp"));
+        assert!(supports_live_model_fetch("sglang"));
         assert!(supports_live_model_fetch("vllm"));
         assert!(supports_live_model_fetch("astrai"));
         assert!(supports_live_model_fetch("venice"));
@@ -6077,6 +6502,10 @@ mod tests {
             Some("http://localhost:8080/v1/models")
         );
         assert_eq!(
+            models_endpoint_for_provider("sglang"),
+            Some("http://localhost:30000/v1/models")
+        );
+        assert_eq!(
             models_endpoint_for_provider("vllm"),
             Some("http://localhost:8000/v1/models")
         );
@@ -6105,6 +6534,10 @@ mod tests {
         assert_eq!(
             resolve_live_models_endpoint("llamacpp", None),
             Some("http://localhost:8080/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("sglang", None),
+            Some("http://localhost:30000/v1/models".to_string())
         );
         assert_eq!(
             resolve_live_models_endpoint("vllm", None),
@@ -6310,6 +6743,7 @@ mod tests {
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
+        assert_eq!(provider_env_var("sglang"), "SGLANG_API_KEY");
         assert_eq!(provider_env_var("vllm"), "VLLM_API_KEY");
         assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
         assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
@@ -6343,8 +6777,15 @@ mod tests {
         assert!(provider_supports_keyless_local_usage("ollama"));
         assert!(provider_supports_keyless_local_usage("llamacpp"));
         assert!(provider_supports_keyless_local_usage("llama.cpp"));
+        assert!(provider_supports_keyless_local_usage("sglang"));
         assert!(provider_supports_keyless_local_usage("vllm"));
         assert!(!provider_supports_keyless_local_usage("openai"));
+    }
+
+    #[test]
+    fn local_provider_choices_include_sglang() {
+        let choices = local_provider_choices();
+        assert!(choices.iter().any(|(provider, _)| *provider == "sglang"));
     }
 
     #[test]
@@ -6405,10 +6846,27 @@ mod tests {
     }
 
     #[test]
-    fn launchable_channels_include_mattermost_and_qq() {
+    fn channel_menu_choices_include_signal_and_nextcloud_talk() {
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::Signal));
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::NextcloudTalk));
+    }
+
+    #[test]
+    fn launchable_channels_include_signal_mattermost_qq_and_nextcloud_talk() {
         let mut channels = ChannelsConfig::default();
         assert!(!has_launchable_channels(&channels));
 
+        channels.signal = Some(crate::config::schema::SignalConfig {
+            http_url: "http://127.0.0.1:8686".into(),
+            account: "+1234567890".into(),
+            group_id: None,
+            allowed_from: vec!["*".into()],
+            ignore_attachments: false,
+            ignore_stories: true,
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.signal = None;
         channels.mattermost = Some(crate::config::schema::MattermostConfig {
             url: "https://mattermost.example.com".into(),
             bot_token: "token".into(),
@@ -6423,6 +6881,15 @@ mod tests {
         channels.qq = Some(crate::config::schema::QQConfig {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.qq = None;
+        channels.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
+            base_url: "https://cloud.example.com".into(),
+            app_token: "token".into(),
+            webhook_secret: Some("secret".into()),
             allowed_users: vec!["*".into()],
         });
         assert!(has_launchable_channels(&channels));

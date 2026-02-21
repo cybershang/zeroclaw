@@ -1,5 +1,6 @@
+use crate::config::traits::ChannelConfig;
 use crate::providers::{is_glm_alias, is_zai_alias};
-use crate::security::AutonomyLevel;
+use crate::security::{AutonomyLevel, DomainMatcher};
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use schemars::JsonSchema;
@@ -85,6 +86,10 @@ pub struct Config {
     /// Autonomy and security policy configuration (`[autonomy]`).
     #[serde(default)]
     pub autonomy: AutonomyConfig,
+
+    /// Security subsystem configuration (`[security]`).
+    #[serde(default)]
+    pub security: SecurityConfig,
 
     /// Runtime adapter configuration (`[runtime]`). Controls native vs Docker execution.
     #[serde(default)]
@@ -1844,11 +1849,12 @@ impl Default for BuiltinHooksConfig {
 pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised` (default), or `full`.
     pub level: AutonomyLevel,
-    /// Restrict file writes and command paths to the workspace directory. Default: `true`.
+    /// Restrict absolute filesystem paths to workspace-relative references. Default: `true`.
+    /// Resolved paths outside the workspace still require `allowed_roots`.
     pub workspace_only: bool,
     /// Allowlist of executable names permitted for shell execution.
     pub allowed_commands: Vec<String>,
-    /// Explicit path denylist. Default includes system-critical paths.
+    /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
     pub forbidden_paths: Vec<String>,
     /// Maximum actions allowed per hour per policy. Default: `100`.
     pub max_actions_per_hour: u32,
@@ -1879,6 +1885,7 @@ pub struct AutonomyConfig {
     pub always_ask: Vec<String>,
 
     /// Extra directory roots the agent may read/write outside the workspace.
+    /// Supports absolute, `~/...`, and workspace-relative entries.
     /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
     #[serde(default)]
     pub allowed_roots: Vec<String>,
@@ -2391,6 +2398,23 @@ pub struct CustomTunnelConfig {
 
 // ── Channels ─────────────────────────────────────────────────────
 
+struct ConfigWrapper<T: ChannelConfig>(std::marker::PhantomData<T>);
+
+impl<T: ChannelConfig> ConfigWrapper<T> {
+    fn new(_: &Option<T>) -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl<T: ChannelConfig> crate::config::traits::ConfigHandle for ConfigWrapper<T> {
+    fn name(&self) -> &'static str {
+        T::name()
+    }
+    fn desc(&self) -> &'static str {
+        T::desc()
+    }
+}
+
 /// Top-level channel configurations (`[channels_config]` section).
 ///
 /// Each channel sub-section (e.g. `telegram`, `discord`) is optional;
@@ -2432,6 +2456,8 @@ pub struct ChannelsConfig {
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
     pub nostr: Option<NostrConfig>,
+    /// ClawdTalk voice channel configuration.
+    pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -2439,6 +2465,92 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+}
+
+impl ChannelsConfig {
+    /// get channels' metadata and `.is_some()`, except webhook
+    #[rustfmt::skip]
+    pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
+        vec![
+            (
+                Box::new(ConfigWrapper::new(&self.telegram)),
+                self.telegram.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.discord)),
+                self.discord.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.slack)),
+                self.slack.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.mattermost)),
+                self.mattermost.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.imessage)),
+                self.imessage.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.matrix)),
+                self.matrix.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.signal)),
+                self.signal.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.whatsapp)),
+                self.whatsapp.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.linq)),
+                self.linq.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.nextcloud_talk)),
+                self.nextcloud_talk.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.email)),
+                self.email.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.irc)),
+                self.irc.is_some()
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.lark)),
+                self.lark.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.dingtalk)),
+                self.dingtalk.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.qq)),
+                self.qq.is_some()
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.nostr)),
+                self.nostr.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.clawdtalk)),
+                self.clawdtalk.is_some(),
+            ),
+        ]
+    }
+
+    pub fn channels(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
+        let mut ret = self.channels_except_webhook();
+        ret.push((
+            Box::new(ConfigWrapper::new(&self.webhook)),
+            self.webhook.is_some(),
+        ));
+        ret
+    }
 }
 
 fn default_channel_message_timeout_secs() -> u64 {
@@ -2466,6 +2578,7 @@ impl Default for ChannelsConfig {
             dingtalk: None,
             qq: None,
             nostr: None,
+            clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
@@ -2509,6 +2622,15 @@ pub struct TelegramConfig {
     pub mention_only: bool,
 }
 
+impl ChannelConfig for TelegramConfig {
+    fn name() -> &'static str {
+        "Telegram"
+    }
+    fn desc() -> &'static str {
+        "connect your bot"
+    }
+}
+
 /// Discord bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiscordConfig {
@@ -2529,6 +2651,15 @@ pub struct DiscordConfig {
     pub mention_only: bool,
 }
 
+impl ChannelConfig for DiscordConfig {
+    fn name() -> &'static str {
+        "Discord"
+    }
+    fn desc() -> &'static str {
+        "connect your bot"
+    }
+}
+
 /// Slack bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SlackConfig {
@@ -2542,6 +2673,15 @@ pub struct SlackConfig {
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for SlackConfig {
+    fn name() -> &'static str {
+        "Slack"
+    }
+    fn desc() -> &'static str {
+        "connect your bot"
+    }
 }
 
 /// Mattermost bot channel configuration.
@@ -2566,6 +2706,15 @@ pub struct MattermostConfig {
     pub mention_only: Option<bool>,
 }
 
+impl ChannelConfig for MattermostConfig {
+    fn name() -> &'static str {
+        "Mattermost"
+    }
+    fn desc() -> &'static str {
+        "connect to your bot"
+    }
+}
+
 /// Webhook channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebhookConfig {
@@ -2575,11 +2724,29 @@ pub struct WebhookConfig {
     pub secret: Option<String>,
 }
 
+impl ChannelConfig for WebhookConfig {
+    fn name() -> &'static str {
+        "Webhook"
+    }
+    fn desc() -> &'static str {
+        "HTTP endpoint"
+    }
+}
+
 /// iMessage channel configuration (macOS only).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IMessageConfig {
     /// Allowed iMessage contacts (phone numbers or email addresses). Empty = deny all.
     pub allowed_contacts: Vec<String>,
+}
+
+impl ChannelConfig for IMessageConfig {
+    fn name() -> &'static str {
+        "iMessage"
+    }
+    fn desc() -> &'static str {
+        "macOS only"
+    }
 }
 
 /// Matrix channel configuration.
@@ -2599,6 +2766,15 @@ pub struct MatrixConfig {
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for MatrixConfig {
+    fn name() -> &'static str {
+        "Matrix"
+    }
+    fn desc() -> &'static str {
+        "self-hosted chat"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2622,6 +2798,15 @@ pub struct SignalConfig {
     /// Skip incoming story messages.
     #[serde(default)]
     pub ignore_stories: bool,
+}
+
+impl ChannelConfig for SignalConfig {
+    fn name() -> &'static str {
+        "Signal"
+    }
+    fn desc() -> &'static str {
+        "An open-source, encrypted messaging service"
+    }
 }
 
 /// WhatsApp channel configuration (Cloud API or Web mode).
@@ -2662,6 +2847,15 @@ pub struct WhatsAppConfig {
     pub allowed_numbers: Vec<String>,
 }
 
+impl ChannelConfig for WhatsAppConfig {
+    fn name() -> &'static str {
+        "WhatsApp"
+    }
+    fn desc() -> &'static str {
+        "Business Cloud API"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LinqConfig {
     /// Linq Partner API token (Bearer auth)
@@ -2674,6 +2868,15 @@ pub struct LinqConfig {
     /// Allowed sender handles (phone numbers) or "*" for all
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+}
+
+impl ChannelConfig for LinqConfig {
+    fn name() -> &'static str {
+        "Linq"
+    }
+    fn desc() -> &'static str {
+        "iMessage/RCS/SMS via Linq API"
+    }
 }
 
 /// Nextcloud Talk bot configuration (webhook receive + OCS send API).
@@ -2691,6 +2894,15 @@ pub struct NextcloudTalkConfig {
     /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for NextcloudTalkConfig {
+    fn name() -> &'static str {
+        "NextCloud Talk"
+    }
+    fn desc() -> &'static str {
+        "NextCloud Talk platform"
+    }
 }
 
 impl WhatsAppConfig {
@@ -2753,6 +2965,15 @@ pub struct IrcConfig {
     pub verify_tls: Option<bool>,
 }
 
+impl ChannelConfig for IrcConfig {
+    fn name() -> &'static str {
+        "IRC"
+    }
+    fn desc() -> &'static str {
+        "IRC over TLS"
+    }
+}
+
 fn default_irc_port() -> u16 {
     6697
 }
@@ -2798,6 +3019,15 @@ pub struct LarkConfig {
     pub port: Option<u16>,
 }
 
+impl ChannelConfig for LarkConfig {
+    fn name() -> &'static str {
+        "Lark/Feishu"
+    }
+    fn desc() -> &'static str {
+        "Lark/Feishu Bot"
+    }
+}
+
 // ── Security Config ─────────────────────────────────────────────────
 
 /// Security configuration for sandboxing, resource limits, and audit logging
@@ -2814,6 +3044,123 @@ pub struct SecurityConfig {
     /// Audit logging configuration
     #[serde(default)]
     pub audit: AuditConfig,
+
+    /// OTP gating configuration for sensitive actions/domains.
+    #[serde(default)]
+    pub otp: OtpConfig,
+
+    /// Emergency-stop state machine configuration.
+    #[serde(default)]
+    pub estop: EstopConfig,
+}
+
+/// OTP validation strategy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OtpMethod {
+    /// Time-based one-time password (RFC 6238).
+    #[default]
+    Totp,
+    /// Future method for paired-device confirmations.
+    Pairing,
+    /// Future method for local CLI challenge prompts.
+    CliPrompt,
+}
+
+/// Security OTP configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OtpConfig {
+    /// Enable OTP gating. Defaults to disabled for backward compatibility.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// OTP method.
+    #[serde(default)]
+    pub method: OtpMethod,
+
+    /// TOTP time-step in seconds.
+    #[serde(default = "default_otp_token_ttl_secs")]
+    pub token_ttl_secs: u64,
+
+    /// Reuse window for recently validated OTP codes.
+    #[serde(default = "default_otp_cache_valid_secs")]
+    pub cache_valid_secs: u64,
+
+    /// Tool/action names gated by OTP.
+    #[serde(default = "default_otp_gated_actions")]
+    pub gated_actions: Vec<String>,
+
+    /// Explicit domain patterns gated by OTP.
+    #[serde(default)]
+    pub gated_domains: Vec<String>,
+
+    /// Domain-category presets expanded into `gated_domains`.
+    #[serde(default)]
+    pub gated_domain_categories: Vec<String>,
+}
+
+fn default_otp_token_ttl_secs() -> u64 {
+    30
+}
+
+fn default_otp_cache_valid_secs() -> u64 {
+    300
+}
+
+fn default_otp_gated_actions() -> Vec<String> {
+    vec![
+        "shell".to_string(),
+        "file_write".to_string(),
+        "browser_open".to_string(),
+        "browser".to_string(),
+        "memory_forget".to_string(),
+    ]
+}
+
+impl Default for OtpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            method: OtpMethod::Totp,
+            token_ttl_secs: default_otp_token_ttl_secs(),
+            cache_valid_secs: default_otp_cache_valid_secs(),
+            gated_actions: default_otp_gated_actions(),
+            gated_domains: Vec::new(),
+            gated_domain_categories: Vec::new(),
+        }
+    }
+}
+
+/// Emergency stop configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EstopConfig {
+    /// Enable emergency stop controls.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// File path used to persist estop state.
+    #[serde(default = "default_estop_state_file")]
+    pub state_file: String,
+
+    /// Require a valid OTP before resume operations.
+    #[serde(default = "default_true")]
+    pub require_otp_to_resume: bool,
+}
+
+fn default_estop_state_file() -> String {
+    "~/.zeroclaw/estop-state.json".to_string()
+}
+
+impl Default for EstopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            state_file: default_estop_state_file(),
+            require_otp_to_resume: true,
+        }
+    }
 }
 
 /// Sandbox configuration for OS-level isolation
@@ -2963,6 +3310,15 @@ pub struct DingTalkConfig {
     pub allowed_users: Vec<String>,
 }
 
+impl ChannelConfig for DingTalkConfig {
+    fn name() -> &'static str {
+        "DingTalk"
+    }
+    fn desc() -> &'static str {
+        "DingTalk Stream Mode"
+    }
+}
+
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
@@ -2973,6 +3329,15 @@ pub struct QQConfig {
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for QQConfig {
+    fn name() -> &'static str {
+        "QQ Official"
+    }
+    fn desc() -> &'static str {
+        "Tencent QQ Bot"
+    }
 }
 
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
@@ -2986,6 +3351,15 @@ pub struct NostrConfig {
     /// Allowed sender public keys (hex or npub). Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_pubkeys: Vec<String>,
+}
+
+impl ChannelConfig for NostrConfig {
+    fn name() -> &'static str {
+        "Nostr"
+    }
+    fn desc() -> &'static str {
+        "Nostr DMs"
+    }
 }
 
 pub fn default_nostr_relays() -> Vec<String> {
@@ -3015,6 +3389,7 @@ impl Default for Config {
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
@@ -3173,7 +3548,7 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
     Ok(())
 }
 
-fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
+pub(crate) fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
     let workspace_config_dir = workspace_dir.to_path_buf();
     if workspace_config_dir.join("config.toml").exists() {
         return (
@@ -3202,6 +3577,17 @@ fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) 
         workspace_config_dir.clone(),
         workspace_config_dir.join("workspace"),
     )
+}
+
+/// Resolve the current runtime config/workspace directories for onboarding flows.
+///
+/// This mirrors the same precedence used by `Config::load_or_init()`:
+/// `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_WORKSPACE` > active workspace marker > defaults.
+pub(crate) async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, PathBuf)> {
+    let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
+    let (config_dir, workspace_dir, _) =
+        resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
+    Ok((config_dir, workspace_dir))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3500,6 +3886,43 @@ impl Config {
                     "autonomy.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
                 );
             }
+        }
+
+        // Security OTP / estop
+        if self.security.otp.token_ttl_secs == 0 {
+            anyhow::bail!("security.otp.token_ttl_secs must be greater than 0");
+        }
+        if self.security.otp.cache_valid_secs == 0 {
+            anyhow::bail!("security.otp.cache_valid_secs must be greater than 0");
+        }
+        if self.security.otp.cache_valid_secs < self.security.otp.token_ttl_secs {
+            anyhow::bail!(
+                "security.otp.cache_valid_secs must be greater than or equal to security.otp.token_ttl_secs"
+            );
+        }
+        for (i, action) in self.security.otp.gated_actions.iter().enumerate() {
+            let normalized = action.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("security.otp.gated_actions[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "security.otp.gated_actions[{i}] contains invalid characters: {normalized}"
+                );
+            }
+        }
+        DomainMatcher::new(
+            &self.security.otp.gated_domains,
+            &self.security.otp.gated_domain_categories,
+        )
+        .with_context(|| {
+            "Invalid security.otp.gated_domains or security.otp.gated_domain_categories"
+        })?;
+        if self.security.estop.state_file.trim().is_empty() {
+            anyhow::bail!("security.estop.state_file must not be empty");
         }
 
         // Scheduler
@@ -4202,6 +4625,7 @@ default_temperature = 0.7
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
             },
+            security: SecurityConfig::default(),
             runtime: RuntimeConfig {
                 kind: "docker".into(),
                 ..RuntimeConfig::default()
@@ -4243,6 +4667,7 @@ default_temperature = 0.7
                 dingtalk: None,
                 qq: None,
                 nostr: None,
+                clawdtalk: None,
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
@@ -4408,6 +4833,7 @@ tool_dispatcher = "xml"
             default_temperature: 0.9,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
@@ -4794,6 +5220,7 @@ allowed_users = ["@ops:matrix.org"]
             dingtalk: None,
             qq: None,
             nostr: None,
+            clawdtalk: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -5005,6 +5432,7 @@ channel_id = "C123"
             dingtalk: None,
             qq: None,
             nostr: None,
+            clawdtalk: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -6451,5 +6879,85 @@ default_model = "legacy-model"
         let parsed: Config = toml::from_str(toml_str).unwrap();
         assert!(!parsed.transcription.enabled);
         assert_eq!(parsed.transcription.max_duration_secs, 120);
+    }
+
+    #[test]
+    async fn security_defaults_are_backward_compatible() {
+        let parsed: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+"#,
+        )
+        .unwrap();
+
+        assert!(!parsed.security.otp.enabled);
+        assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
+        assert!(!parsed.security.estop.enabled);
+        assert!(parsed.security.estop.require_otp_to_resume);
+    }
+
+    #[test]
+    async fn security_toml_parses_otp_and_estop_sections() {
+        let parsed: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[security.otp]
+enabled = true
+method = "totp"
+token_ttl_secs = 30
+cache_valid_secs = 120
+gated_actions = ["shell", "browser_open"]
+gated_domains = ["*.chase.com", "accounts.google.com"]
+gated_domain_categories = ["banking"]
+
+[security.estop]
+enabled = true
+state_file = "~/.zeroclaw/estop-state.json"
+require_otp_to_resume = true
+"#,
+        )
+        .unwrap();
+
+        assert!(parsed.security.otp.enabled);
+        assert!(parsed.security.estop.enabled);
+        assert_eq!(parsed.security.otp.gated_actions.len(), 2);
+        assert_eq!(parsed.security.otp.gated_domains.len(), 2);
+        parsed.validate().unwrap();
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_domain_glob() {
+        let mut config = Config::default();
+        config.security.otp.gated_domains = vec!["bad domain.com".into()];
+
+        let err = config.validate().expect_err("expected invalid domain glob");
+        assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_unknown_domain_category() {
+        let mut config = Config::default();
+        config.security.otp.gated_domain_categories = vec!["not_real".into()];
+
+        let err = config
+            .validate()
+            .expect_err("expected unknown domain category");
+        assert!(err.to_string().contains("gated_domain_categories"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_token_ttl() {
+        let mut config = Config::default();
+        config.security.otp.token_ttl_secs = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected ttl validation failure");
+        assert!(err.to_string().contains("token_ttl_secs"));
     }
 }

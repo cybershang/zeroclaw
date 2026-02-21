@@ -114,6 +114,14 @@ impl Tool for ShellTool {
             }
         }
 
+        if let Some(path) = self.security.forbidden_path_argument(command) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Path blocked by security policy: {path}")),
+            });
+        }
+
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
@@ -296,6 +304,81 @@ mod tests {
         assert!(!result.success);
     }
 
+    #[tokio::test]
+    async fn shell_blocks_absolute_path_argument() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"command": "cat /etc/passwd"}))
+            .await
+            .expect("absolute path argument should be blocked");
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Path blocked"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_option_assignment_path_argument() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"command": "grep --file=/etc/passwd root ./src"}))
+            .await
+            .expect("option-assigned forbidden path should be blocked");
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Path blocked"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_short_option_attached_path_argument() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"command": "grep -f/etc/passwd root ./src"}))
+            .await
+            .expect("short option attached forbidden path should be blocked");
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Path blocked"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_tilde_user_path_argument() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"command": "cat ~root/.ssh/id_rsa"}))
+            .await
+            .expect("tilde-user path should be blocked");
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Path blocked"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_input_redirection_path_bypass() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"command": "cat </etc/passwd"}))
+            .await
+            .expect("input redirection bypass should be blocked");
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("not allowed"));
+    }
+
     fn test_security_with_env_cmd() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -361,28 +444,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_preserves_path_and_home() {
+    async fn shell_preserves_path_and_home_for_env_command() {
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
 
         let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command should succeed");
+        assert!(result.success);
+        assert!(
+            result.output.contains("HOME="),
+            "HOME should be available in shell environment"
+        );
+        assert!(
+            result.output.contains("PATH="),
+            "PATH should be available in shell environment"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_plain_variable_expansion() {
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let result = tool
             .execute(json!({"command": "echo $HOME"}))
             .await
-            .expect("echo HOME command should succeed");
-        assert!(result.success);
-        assert!(
-            !result.output.trim().is_empty(),
-            "HOME should be available in shell"
-        );
-
-        let result = tool
-            .execute(json!({"command": "echo $PATH"}))
-            .await
-            .expect("echo PATH command should succeed");
-        assert!(result.success);
-        assert!(
-            !result.output.trim().is_empty(),
-            "PATH should be available in shell"
-        );
+            .expect("plain variable expansion should be blocked");
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("not allowed"));
     }
 
     #[tokio::test(flavor = "current_thread")]

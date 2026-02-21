@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 19, 2026**.
+Last verified: **February 21, 2026**.
 
 Config path resolution at startup:
 
@@ -89,6 +89,52 @@ Notes:
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
 
+## `[security.otp]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable OTP gating for sensitive actions/domains |
+| `method` | `totp` | OTP method (`totp`, `pairing`, `cli-prompt`) |
+| `token_ttl_secs` | `30` | TOTP time-step window in seconds |
+| `cache_valid_secs` | `300` | Cache window for recently validated OTP codes |
+| `gated_actions` | `["shell","file_write","browser_open","browser","memory_forget"]` | Tool actions protected by OTP |
+| `gated_domains` | `[]` | Explicit domain patterns requiring OTP (`*.example.com`, `login.example.com`) |
+| `gated_domain_categories` | `[]` | Domain preset categories (`banking`, `medical`, `government`, `identity_providers`) |
+
+Notes:
+
+- Domain patterns support wildcard `*`.
+- Category presets expand to curated domain sets during validation.
+- Invalid domain globs or unknown categories fail fast at startup.
+- When `enabled = true` and no OTP secret exists, ZeroClaw generates one and prints an enrollment URI once.
+
+Example:
+
+```toml
+[security.otp]
+enabled = true
+method = "totp"
+token_ttl_secs = 30
+cache_valid_secs = 300
+gated_actions = ["shell", "browser_open"]
+gated_domains = ["*.chase.com", "accounts.google.com"]
+gated_domain_categories = ["banking"]
+```
+
+## `[security.estop]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable emergency-stop state machine and CLI |
+| `state_file` | `~/.zeroclaw/estop-state.json` | Persistent estop state path |
+| `require_otp_to_resume` | `true` | Require OTP validation before resume operations |
+
+Notes:
+
+- Estop state is persisted atomically and reloaded on startup.
+- Corrupted/unreadable estop state falls back to fail-closed `kill_all`.
+- Use CLI command `zeroclaw estop` to engage and `zeroclaw estop resume` to clear levels.
+
 ## `[agents.<name>]`
 
 Delegate sub-agent configurations. Each key under `[agents]` defines a named sub-agent that the primary agent can delegate to.
@@ -156,6 +202,7 @@ Notes:
   - `ZEROCLAW_SKILLS_PROMPT_MODE` accepts `full` or `compact`.
 - Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
 - `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
+- Skill loading and `zeroclaw skills install` both apply a static security audit. Skills that contain symlinks, script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
 
 ## `[composio]`
 
@@ -225,7 +272,7 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `browser_open` tool (opens URLs without scraping) |
-| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact or subdomain match) |
+| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
 | `native_headless` | `true` | Headless mode for rust-native backend |
@@ -255,14 +302,15 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `http_request` tool for API interactions |
-| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact or subdomain match) |
+| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact/subdomain match, or `"*"` for all public domains) |
 | `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
 | `timeout_secs` | `30` | Request timeout in seconds |
 
 Notes:
 
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
-- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`).
+- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
+- Local/private targets are still blocked even when `"*"` is configured.
 
 ## `[gateway]`
 
@@ -278,11 +326,12 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
-| `workspace_only` | `true` | restrict writes/command paths to workspace scope |
+| `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names |
-| `forbidden_paths` | `[]` | explicit path denylist |
-| `max_actions_per_hour` | `100` | per-policy action budget |
-| `max_cost_per_day_cents` | `1000` | per-policy spend guardrail |
+| `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
+| `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
+| `max_actions_per_hour` | `20` | per-policy action budget |
+| `max_cost_per_day_cents` | `500` | per-policy spend guardrail |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |
@@ -291,8 +340,17 @@ Notes:
 Notes:
 
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
+- Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
+- `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
+
+```toml
+[autonomy]
+workspace_only = false
+forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
+allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
+```
 
 ## `[memory]`
 
@@ -354,6 +412,17 @@ Upgrade strategy:
 1. Keep hints stable (`hint:reasoning`, `hint:semantic`).
 2. Update only `model = "...new-version..."` in the route entries.
 3. Validate with `zeroclaw doctor` before restart/rollout.
+
+Natural-language config path:
+
+- During normal agent chat, ask the assistant to rewire routes in plain language.
+- The runtime can persist these updates via tool `model_routing_config` (defaults, scenarios, and delegate sub-agents) without manual TOML editing.
+
+Example requests:
+
+- `Set conversation to provider kimi, model moonshot-v1-8k.`
+- `Set coding to provider openai, model gpt-5.3-codex, and auto-route when message contains code blocks.`
+- `Create a coder sub-agent using openai/gpt-5.3-codex with tools file_read,file_write,shell.`
 
 ## `[query_classification]`
 

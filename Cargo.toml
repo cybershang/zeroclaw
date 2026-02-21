@@ -7,7 +7,7 @@ name = "zeroclaw"
 version = "0.1.1"
 edition = "2021"
 authors = ["theonlyhennygod"]
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 readme = "README.md"
@@ -29,7 +29,7 @@ tokio-stream = { version = "0.1.18", default-features = false, features = ["fs",
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
 
 # Matrix client + E2EE decryption
-matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown"] }
+matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -91,7 +91,7 @@ async-trait = "0.1"
 ring = "0.17"
 
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
-prost = { version = "0.14", default-features = false, optional = true }
+prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -108,7 +108,7 @@ console = "0.16"
 glob = "0.3"
 
 # Binary discovery (init system detection)
-which = "7.0"
+which = "8.0"
 
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
