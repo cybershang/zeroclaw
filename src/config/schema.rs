@@ -206,6 +206,10 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// Iterative/autonomous execution configuration (`[iterative]`).
+    #[serde(default)]
+    pub iterative: IterativeConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -360,6 +364,89 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
+        }
+    }
+}
+
+// ── Iterative/Autonomous Execution ───────────────────────────────
+
+/// Stuck detection configuration for iterative execution.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct StuckDetectionConfig {
+    /// Threshold for detecting duplicate actions (default: 3).
+    #[serde(default = "default_duplicate_threshold")]
+    pub duplicate_action_threshold: usize,
+    
+    /// Interval for LLM progress assessment in steps (default: 5).
+    #[serde(default = "default_assess_interval")]
+    pub assess_interval: usize,
+    
+    /// Threshold for consecutive failures (default: 3).
+    #[serde(default = "default_consecutive_failure_threshold")]
+    pub consecutive_failure_threshold: usize,
+    
+    /// Threshold for long-running tasks (default: 50).
+    #[serde(default = "default_long_running_threshold")]
+    pub long_running_threshold: usize,
+    
+    /// User feedback timeout in minutes (default: 60).
+    #[serde(default = "default_user_timeout_minutes")]
+    pub user_timeout_minutes: u64,
+}
+
+fn default_duplicate_threshold() -> usize {
+    3
+}
+
+fn default_assess_interval() -> usize {
+    5
+}
+
+fn default_consecutive_failure_threshold() -> usize {
+    3
+}
+
+fn default_long_running_threshold() -> usize {
+    50
+}
+
+fn default_user_timeout_minutes() -> u64 {
+    60
+}
+
+impl Default for StuckDetectionConfig {
+    fn default() -> Self {
+        Self {
+            duplicate_action_threshold: default_duplicate_threshold(),
+            assess_interval: default_assess_interval(),
+            consecutive_failure_threshold: default_consecutive_failure_threshold(),
+            long_running_threshold: default_long_running_threshold(),
+            user_timeout_minutes: default_user_timeout_minutes(),
+        }
+    }
+}
+
+/// Iterative/autonomous execution configuration (`[iterative]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IterativeConfig {
+    /// Enable iterative execution mode (default: true).
+    #[serde(default = "default_iterative_enabled")]
+    pub enabled: bool,
+    
+    /// Stuck detection parameters.
+    #[serde(default)]
+    pub stuck_detection: StuckDetectionConfig,
+}
+
+fn default_iterative_enabled() -> bool {
+    true
+}
+
+impl Default for IterativeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_iterative_enabled(),
+            stuck_detection: StuckDetectionConfig::default(),
         }
     }
 }
@@ -3419,6 +3506,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            iterative: IterativeConfig::default(),
         }
     }
 }
@@ -4689,6 +4777,7 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            iterative: IterativeConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -4863,6 +4952,7 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            iterative: IterativeConfig::default(),
         };
 
         config.save().await.unwrap();

@@ -167,6 +167,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
+        iterative: crate::config::IterativeConfig::default(),
     };
 
     println!(
@@ -515,6 +516,7 @@ async fn run_quick_setup_with_home(
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
+        iterative: crate::config::IterativeConfig::default(),
     };
 
     config.save().await?;

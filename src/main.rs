@@ -67,6 +67,7 @@ mod heartbeat;
 mod hooks;
 mod identity;
 mod integrations;
+mod iterative;
 mod memory;
 mod migration;
 mod multimodal;
@@ -438,6 +439,38 @@ Examples:
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
+    },
+
+    /// Run iterative/autonomous task execution
+    #[command(long_about = "\
+Run iterative/autonomous task execution.
+
+Executes a long-running task with automatic stuck detection and user notification.
+The agent will autonomously work on the task, calling tools and making progress.
+When stuck is detected (repeating actions, consecutive failures, or no progress),
+the agent will pause and notify you via configured channels for guidance.
+
+Examples:
+  zeroclaw iterative \"Implement a REST API for user authentication\"
+  zeroclaw iterative \"Fix all clippy warnings in the codebase\" --max-steps 100
+  zeroclaw task list                          # list all tasks
+  zeroclaw task continue task_abc123          # continue a waiting task")]
+    Iterative {
+        /// Task description/goal
+        #[arg(required = true)]
+        goal: String,
+
+        /// Maximum total steps before forcing user confirmation
+        #[arg(long)]
+        max_steps: Option<usize>,
+
+        /// Continue a previously created task
+        #[arg(long)]
+        continue_task: Option<String>,
+
+        /// List all iterative tasks
+        #[arg(long)]
+        list: bool,
     },
 
     /// Generate shell completion script to stdout
@@ -990,6 +1023,75 @@ async fn main() -> Result<()> {
 
         Commands::Peripheral { peripheral_command } => {
             peripherals::handle_command(peripheral_command.clone(), &config).await
+        }
+
+        Commands::Iterative {
+            goal,
+            max_steps,
+            continue_task,
+            list,
+        } => {
+            // Initialize iterative module
+            iterative::init(&config).await?;
+
+            if list {
+                let tasks = iterative::list_tasks(&config, None).await?;
+                println!("Iterative tasks:");
+                for task in tasks {
+                    let status_str = match &task.status {
+                        iterative::TaskStatus::Running => "🟢 Running",
+                        iterative::TaskStatus::WaitingForUserInput(_) => "⏸️  Waiting",
+                        iterative::TaskStatus::Completed => "✅ Completed",
+                        iterative::TaskStatus::Failed => "❌ Failed",
+                    };
+                    println!("  {} - {} - {}", task.task_id, status_str, task.goal);
+                }
+                return Ok(());
+            }
+
+            if let Some(task_id) = continue_task {
+                let outcome = iterative::continue_task(&config, &task_id, &config.iterative).await?;
+                match outcome {
+                    iterative::TaskOutcome::Success { task_id, total_steps } => {
+                        println!("Task {} completed in {} steps", task_id, total_steps);
+                    }
+                    iterative::TaskOutcome::WaitingForUser { task_id, .. } => {
+                        println!("Task {} is waiting for your input", task_id);
+                    }
+                    iterative::TaskOutcome::Failed { task_id, reason } => {
+                        println!("Task {} failed: {}", task_id, reason);
+                    }
+                }
+                return Ok(());
+            }
+
+            // Run new iterative task
+            let mut iterative_config = config.iterative.clone();
+            if let Some(steps) = max_steps {
+                iterative_config.stuck_detection.long_running_threshold = steps;
+            }
+
+            println!("🤖 Starting iterative task: {}", goal);
+            println!("   The agent will autonomously work on this task.");
+            println!("   You'll be notified when guidance is needed.\n");
+
+            let outcome = iterative::run_iterative(&config, &goal, &iterative_config).await?;
+
+            match outcome {
+                iterative::TaskOutcome::Success { task_id, total_steps } => {
+                    println!("\n✅ Task {} completed successfully in {} steps!", task_id, total_steps);
+                }
+                iterative::TaskOutcome::WaitingForUser { task_id, .. } => {
+                    println!("\n⏸️  Task {} is waiting for your input.", task_id);
+                    println!("   Check your configured channels (Telegram, Lark, etc.) for details.");
+                    println!("   Resume with: zeroclaw iterative --continue-task {}", task_id);
+                }
+                iterative::TaskOutcome::Failed { task_id, reason } => {
+                    println!("\n❌ Task {} failed: {}", task_id, reason);
+                }
+            }
+
+            Ok(())
         }
 
         Commands::Config { config_command } => match config_command {
