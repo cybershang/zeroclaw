@@ -14,46 +14,132 @@ const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
-const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &["OK", "加油", "鼓掌", "碰拳", "看", "奋斗", "强"];
-const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &[
-    "我看行",
-    "OK",
-    "加油",
-    "鼓掌",
-    "碰拳",
-    "看",
-    "奮鬥",
-    "強",
-    "很 OK",
-];
-const LARK_ACK_REACTIONS_EN: &[&str] = &[
-    "LooksGoodToMe",
-    "OK",
-    "Praise",
-    "Determined",
-    "Glance",
-    "FistBump",
-    "Applaud",
-    "FightOn",
-];
-const LARK_ACK_REACTIONS_JA: &[&str] = &[
-    "いいと思う",
-    "OK",
-    "よくできた",
-    "頑張る",
-    "見る",
-    "グータッチ",
-    "拍手",
-    "頑張れ",
+// Lark/Feishu message reaction emoji_type constants.
+// See: https://open.feishu.cn/document/server-docs/im-v1/message-reaction/overview-of-message-reaction-resources
+// Reaction types are standard uppercase identifiers, not localized strings.
+const LARK_ACK_REACTIONS: &[&str] = &[
+    // 积极/确认类
+    "OK",         // OK
+    "THUMBSUP",   // 👍
+    "THANKS",     // 🙏
+    "MUSCLE",     // 💪
+    "FINGERHEART",// ❤️
+    "APPLAUSE",   // 👏
+    "FISTBUMP",   // 👊
+    "JIAYI",      // 🎉 加油
+    "DONE",       // ✅
+    "SMILE",      // 😊
+    "BLUSH",      // 😁
+    "LAUGH",      // 😄
+    "SMIRK",      // 😏
+    "LOL",        // 😆
+    "LOVE",       // 😍
+    "WINK",       // 😉
+    "PROUD",      // 😌
+    "WITTY",      // 😜
+    "SMART",      // 🤓
+    "JOYFUL",     // 😂
+    "WOW",        // 😮
+    "YEAH",       // 🤟
+    "PRAISE",     // 🌟
+    "STRIVE",     // 💪 奋斗
+    "XBLUSH",     // 😊
+    "CLAP",       // 👏
+    "LGTM",       // Looks Good To Me
+    "OnIt",       // 处理中
+    "YouAreTheBest", // 你最棒
+    "SALUTE",     // 🫡
+    "HIGHFIVE",   // 🙌
+    "HEART",      // ❤️
+    "PARTY",      // 🎉
+    "YES",        // 是
+    "CheckMark",  // ✓
+    "Hundred",    // 100分
+    "AWESOMEN",   // 太棒了
+    "Trophy",     // 🏆
+    "Fire",       // 🔥
+    "LUCK",       // 🍀
+    "FORTUNE",    // 🧧
+    "GoGoGo",     // 冲冲冲
+    "ThanksFace", // 感谢脸
+    "SaluteFace", // 敬礼脸
+    "BeamingFace",// 笑脸
+    "Delighted",  // 开心
+    "Partying",   // 派对
+    "HappyDragon",// 龙年快乐
+    // 中性/其他类
+    "GLANCE",     // 👀
+    "THINKING",   // 🤔
+    "FACEPALM",   // 🤦
+    "SCOWL",      // 😒
+    "DULL",       // 😑
+    "WHAT",       // 😧
+    "FROWN",      // 😟
+    "SHY",        // 😳
+    "DIZZY",      // 😵
+    "LOOKDOWN",   // 😔
+    "CHUCKLE",    // 😅
+    "SILENT",     // 😶
+    "WAVE",       // 👋
+    "HUG",        // 🤗
+    "SIGH",       // 😤
+    "STATUSREADING",    // 阅读中
+    "STATUSINFLIGHT",   // 飞行中
+    "GENERALWORKFROMHOME", // 居家办公
+    "GENERALBUSINESSTRIP", // 出差中
+    "GENERALINMEETINGBUSY",// 会议中
+    "GENERALDONOTDISTURB", // 请勿打扰
+    "Status_PrivateMessage", // 私聊中
+    "GENERALTRAVELLINGCAR",  // 驾车中
+    "STATUSBUS",    // 坐公交
+    "GENERALMOONREST", // 休息中
+    // 消极类
+    "ERROR",      // ❌
+    "CRY",        // 😢
+    "SOB",        // 😭
+    "NOSEPICK",   // 🤧
+    "HAUGHTY",    // 😤
+    "SLAP",       // 🤚
+    "SPITBLOOD",  // 🤮
+    "TOASTED",    // 🥵
+    "ENOUGH",     // 🙅
+    "TEARS",      // 😰
+    "EMBARRASSED",// 😓
+    "SMUG",       // 😏
+    "ANGRY",      // 😠
+    "HAMMER",     // 🔨
+    "SHOCKED",    // 😱
+    "TERROR",     // 😨
+    "PETRIFIED",  // 😰
+    "SKULL",      // 💀
+    "SWEAT",      // 😓
+    "SPEECHLESS", // 😶
+    "SLEEP",      // 😴
+    "DROWSY",     // 😪
+    "YAWN",       // 😫
+    "SICK",       // 🤒
+    "PUKE",       // 🤮
+    "BETRAYED",   // 😩
+    "WRONGED",    // 😞
+    "HUSKY",      // 🐺
+    "CRAZY",      // 🤪
+    "WHIMPER",    // 😫
+    "BLUBBER",    // 😭
+    "SHHH",       // 🤫
+    "WAIL",       // 😭
+    "NO",         // 否
+    "CrossMark",  // ✗
+    "HEARTBROKEN",// 💔
+    "POOP",       // 💩
+    "ThumbsDown", // 👎
+    "MinusOne",   // -1
+    "SLIGHT",     // 😒
+    "CLEAVER",    // 🔪
+    "SHRUG",      // 🤷
+    "ColdSweat",  // 😰
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LarkAckLocale {
-    ZhCn,
-    ZhTw,
-    En,
-    Ja,
-}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Feishu WebSocket long-connection: pbbp2.proto frame codec
@@ -1062,189 +1148,14 @@ fn random_from_pool(pool: &'static [&'static str]) -> &'static str {
     pool[pick_uniform_index(pool.len())]
 }
 
-fn lark_ack_pool(locale: LarkAckLocale) -> &'static [&'static str] {
-    match locale {
-        LarkAckLocale::ZhCn => LARK_ACK_REACTIONS_ZH_CN,
-        LarkAckLocale::ZhTw => LARK_ACK_REACTIONS_ZH_TW,
-        LarkAckLocale::En => LARK_ACK_REACTIONS_EN,
-        LarkAckLocale::Ja => LARK_ACK_REACTIONS_JA,
-    }
-}
-
-fn map_locale_tag(tag: &str) -> Option<LarkAckLocale> {
-    let normalized = tag.trim().to_ascii_lowercase().replace('-', "_");
-    if normalized.is_empty() {
-        return None;
-    }
-
-    if normalized.starts_with("ja") {
-        return Some(LarkAckLocale::Ja);
-    }
-    if normalized.starts_with("en") {
-        return Some(LarkAckLocale::En);
-    }
-    if normalized.contains("hant")
-        || normalized.starts_with("zh_tw")
-        || normalized.starts_with("zh_hk")
-        || normalized.starts_with("zh_mo")
-    {
-        return Some(LarkAckLocale::ZhTw);
-    }
-    if normalized.starts_with("zh") {
-        return Some(LarkAckLocale::ZhCn);
-    }
-    None
-}
-
-fn find_locale_hint(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for key in [
-                "locale",
-                "language",
-                "lang",
-                "i18n_locale",
-                "user_locale",
-                "locale_id",
-            ] {
-                if let Some(locale) = map.get(key).and_then(serde_json::Value::as_str) {
-                    return Some(locale.to_string());
-                }
-            }
-
-            for child in map.values() {
-                if let Some(locale) = find_locale_hint(child) {
-                    return Some(locale);
-                }
-            }
-            None
-        }
-        serde_json::Value::Array(items) => {
-            for child in items {
-                if let Some(locale) = find_locale_hint(child) {
-                    return Some(locale);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn detect_locale_from_post_content(content: &str) -> Option<LarkAckLocale> {
-    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let obj = parsed.as_object()?;
-    for key in obj.keys() {
-        if let Some(locale) = map_locale_tag(key) {
-            return Some(locale);
-        }
-    }
-    None
-}
-
-fn is_japanese_kana(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x3040..=0x309F | // Hiragana
-        0x30A0..=0x30FF | // Katakana
-        0x31F0..=0x31FF // Katakana Phonetic Extensions
-    )
-}
-
-fn is_cjk_han(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x3400..=0x4DBF | // CJK Extension A
-        0x4E00..=0x9FFF // CJK Unified Ideographs
-    )
-}
-
-fn is_traditional_only_han(ch: char) -> bool {
-    matches!(
-        ch,
-        '奮' | '鬥'
-            | '強'
-            | '體'
-            | '國'
-            | '臺'
-            | '萬'
-            | '與'
-            | '為'
-            | '這'
-            | '學'
-            | '機'
-            | '開'
-            | '裡'
-    )
-}
-
-fn is_simplified_only_han(ch: char) -> bool {
-    matches!(
-        ch,
-        '奋' | '斗'
-            | '强'
-            | '体'
-            | '国'
-            | '台'
-            | '万'
-            | '与'
-            | '为'
-            | '这'
-            | '学'
-            | '机'
-            | '开'
-            | '里'
-    )
-}
-
-fn detect_locale_from_text(text: &str) -> Option<LarkAckLocale> {
-    if text.chars().any(is_japanese_kana) {
-        return Some(LarkAckLocale::Ja);
-    }
-    if text.chars().any(is_traditional_only_han) {
-        return Some(LarkAckLocale::ZhTw);
-    }
-    if text.chars().any(is_simplified_only_han) {
-        return Some(LarkAckLocale::ZhCn);
-    }
-    if text.chars().any(is_cjk_han) {
-        return Some(LarkAckLocale::ZhCn);
-    }
-    None
-}
-
-fn detect_lark_ack_locale(
-    payload: Option<&serde_json::Value>,
-    fallback_text: &str,
-) -> LarkAckLocale {
-    if let Some(payload) = payload {
-        if let Some(locale) = find_locale_hint(payload).and_then(|hint| map_locale_tag(&hint)) {
-            return locale;
-        }
-
-        let message_content = payload
-            .pointer("/message/content")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                payload
-                    .pointer("/event/message/content")
-                    .and_then(serde_json::Value::as_str)
-            });
-
-        if let Some(locale) = message_content.and_then(detect_locale_from_post_content) {
-            return locale;
-        }
-    }
-
-    detect_locale_from_text(fallback_text).unwrap_or(LarkAckLocale::En)
-}
-
+/// Returns a random reaction emoji type from the standard Lark/Feishu reaction pool.
+/// The emoji_type values are uppercase standard identifiers (e.g., "OK", "THUMBSUP", "JIAYI")
+/// and do not vary by locale.
 fn random_lark_ack_reaction(
-    payload: Option<&serde_json::Value>,
-    fallback_text: &str,
+    _payload: Option<&serde_json::Value>,
+    _fallback_text: &str,
 ) -> &'static str {
-    let locale = detect_lark_ack_locale(payload, fallback_text);
-    random_from_pool(lark_ack_pool(locale))
+    random_from_pool(LARK_ACK_REACTIONS)
 }
 
 /// Flatten a Feishu `post` rich-text message to plain text.
@@ -1800,99 +1711,31 @@ mod tests {
     }
 
     #[test]
-    fn lark_reaction_locale_explicit_language_tags() {
-        assert_eq!(map_locale_tag("zh-CN"), Some(LarkAckLocale::ZhCn));
-        assert_eq!(map_locale_tag("zh_TW"), Some(LarkAckLocale::ZhTw));
-        assert_eq!(map_locale_tag("zh-Hant"), Some(LarkAckLocale::ZhTw));
-        assert_eq!(map_locale_tag("en-US"), Some(LarkAckLocale::En));
-        assert_eq!(map_locale_tag("ja-JP"), Some(LarkAckLocale::Ja));
-        assert_eq!(map_locale_tag("fr-FR"), None);
-    }
-
-    #[test]
-    fn lark_reaction_locale_prefers_explicit_payload_locale() {
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "ja-JP"
-            },
-            "message": {
-                "content": "{\"text\":\"hello\"}"
-            }
-        });
-        assert_eq!(
-            detect_lark_ack_locale(Some(&payload), "你好，世界"),
-            LarkAckLocale::Ja
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_unsupported_payload_falls_back_to_text_script() {
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "fr-FR"
-            },
-            "message": {
-                "content": "{\"text\":\"頑張れ\"}"
-            }
-        });
-        assert_eq!(
-            detect_lark_ack_locale(Some(&payload), "頑張ってください"),
-            LarkAckLocale::Ja
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_detects_simplified_and_traditional_text() {
-        assert_eq!(
-            detect_lark_ack_locale(None, "继续奋斗，今天很强"),
-            LarkAckLocale::ZhCn
-        );
-        assert_eq!(
-            detect_lark_ack_locale(None, "繼續奮鬥，今天很強"),
-            LarkAckLocale::ZhTw
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_defaults_to_english_for_unsupported_text() {
-        assert_eq!(
-            detect_lark_ack_locale(None, "Bonjour tout le monde"),
-            LarkAckLocale::En
-        );
-    }
-
-    #[test]
-    fn random_lark_ack_reaction_respects_detected_locale_pool() {
+    fn random_lark_ack_reaction_returns_valid_emoji_type() {
+        // Emoji types are standard identifiers, not locale-specific strings
         let payload = serde_json::json!({
             "sender": {
                 "locale": "zh-CN"
             }
         });
         let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_ZH_CN.contains(&selected));
+        assert!(
+            LARK_ACK_REACTIONS.contains(&selected),
+            "selected reaction should be in the standard reaction pool"
+        );
 
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "zh-TW"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_ZH_TW.contains(&selected));
-
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "en-US"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_EN.contains(&selected));
-
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "ja-JP"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
+        // Verify all reactions are valid ascii emoji types (PascalCase or UPPER_CASE with underscores)
+        for reaction in LARK_ACK_REACTIONS {
+            assert!(
+                reaction.chars().all(|c| c.is_ascii_alphabetic() || c == '_'),
+                "emoji_type should contain only ascii letters or underscores: {}",
+                reaction
+            );
+            assert!(
+                reaction.chars().next().map_or(false, |c| c.is_ascii_uppercase()),
+                "emoji_type should start with uppercase: {}",
+                reaction
+            );
+        }
     }
 }
