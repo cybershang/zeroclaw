@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    NormalizedStopReason, Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -68,6 +68,8 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -83,6 +85,14 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: String,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +138,8 @@ struct SystemBlock {
 struct NativeChatResponse {
     #[serde(default)]
     content: Vec<NativeContentIn>,
+    #[serde(default)]
+    stop_reason: Option<String>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
 }
@@ -210,7 +222,7 @@ impl AnthropicProvider {
                     | NativeContentOut::ToolResult { cache_control, .. } => {
                         *cache_control = Some(CacheControl::ephemeral());
                     }
-                    NativeContentOut::ToolUse { .. } => {}
+                    NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
                 }
             }
         }
@@ -291,6 +303,44 @@ impl AnthropicProvider {
         })
     }
 
+    fn parse_inline_image(marker_content: &str) -> Option<NativeContentOut> {
+        let rest = marker_content.strip_prefix("data:")?;
+        let semi_pos = rest.find(';')?;
+        let media_type = rest[..semi_pos].to_string();
+        let after_semi = &rest[semi_pos + 1..];
+        let data = after_semi.strip_prefix("base64,")?;
+        Some(NativeContentOut::Image {
+            source: ImageSource {
+                kind: "base64",
+                media_type,
+                data: data.to_string(),
+            },
+        })
+    }
+
+    fn build_user_content_blocks(content: &str) -> Vec<NativeContentOut> {
+        let (text_part, image_refs) = crate::multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return vec![NativeContentOut::Text {
+                text: content.to_string(),
+                cache_control: None,
+            }];
+        }
+        let mut blocks = Vec::new();
+        if !text_part.trim().is_empty() {
+            blocks.push(NativeContentOut::Text {
+                text: text_part,
+                cache_control: None,
+            });
+        }
+        for marker_content in image_refs {
+            if let Some(image_block) = Self::parse_inline_image(&marker_content) {
+                blocks.push(image_block);
+            }
+        }
+        blocks
+    }
+
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
         let mut system_text = None;
         let mut native_messages = Vec::new();
@@ -334,10 +384,7 @@ impl AnthropicProvider {
                 _ => {
                     native_messages.push(NativeMessage {
                         role: "user".to_string(),
-                        content: vec![NativeContentOut::Text {
-                            text: msg.content.clone(),
-                            cache_control: None,
-                        }],
+                        content: Self::build_user_content_blocks(&msg.content),
                     });
                 }
             }
@@ -363,14 +410,19 @@ impl AnthropicProvider {
         response
             .content
             .into_iter()
-            .find(|c| c.kind == "text")
-            .and_then(|c| c.text)
+            .filter(|c| c.kind == "text")
+            .filter_map(|c| c.text.map(|text| text.trim().to_string()))
+            .find(|text| !text.is_empty())
             .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
     }
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let raw_stop_reason = response.stop_reason.clone();
+        let stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_anthropic_stop_reason);
 
         let usage = response.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
@@ -412,6 +464,10 @@ impl AnthropicProvider {
             },
             tool_calls,
             usage,
+            reasoning_content: None,
+            quota_metadata: None,
+            stop_reason,
+            raw_stop_reason,
         }
     }
 
@@ -505,12 +561,25 @@ impl Provider for AnthropicProvider {
             return Err(super::api_error("Anthropic", response).await);
         }
 
+        // Extract quota metadata from response headers before consuming body
+        let quota_extractor = super::quota_adapter::UniversalQuotaExtractor::new();
+        let quota_metadata = quota_extractor.extract("anthropic", response.headers(), None);
+
         let native_response: NativeChatResponse = response.json().await?;
-        Ok(Self::parse_native_response(native_response))
+        let mut result = Self::parse_native_response(native_response);
+        result.quota_metadata = quota_metadata;
+        Ok(result)
     }
 
     fn supports_native_tools(&self) -> bool {
         true
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
     }
 
     async fn chat_with_tools(
@@ -1351,5 +1420,43 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn parse_text_response_ignores_empty_and_whitespace_text_blocks() {
+        let json = r#"{
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "   \n  "},
+                {"type": "text", "text": "  final answer  "}
+            ]
+        }"#;
+        let response: ChatResponse = serde_json::from_str(json).unwrap();
+
+        let parsed = AnthropicProvider::parse_text_response(response).unwrap();
+        assert_eq!(parsed, "final answer");
+    }
+
+    #[test]
+    fn parse_text_response_rejects_empty_or_whitespace_only_text_blocks() {
+        let json = r#"{
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "   \n  "},
+                {"type": "tool_use", "id": "tool_1", "name": "shell"}
+            ]
+        }"#;
+        let response: ChatResponse = serde_json::from_str(json).unwrap();
+
+        let err = AnthropicProvider::parse_text_response(response).unwrap_err();
+        assert!(err.to_string().contains("No response from Anthropic"));
+    }
+
+    #[test]
+    fn capabilities_reports_vision_and_native_tool_calling() {
+        let provider = AnthropicProvider::new(Some("test-key"));
+        let caps = provider.capabilities();
+        assert!(caps.vision);
+        assert!(caps.native_tool_calling);
     }
 }

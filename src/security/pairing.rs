@@ -19,10 +19,56 @@ const MAX_PAIR_ATTEMPTS: u32 = 5;
 /// Lockout duration after too many failed pairing attempts.
 const PAIR_LOCKOUT_SECS: u64 = 300; // 5 minutes
 /// Maximum number of tracked client entries to bound memory usage.
-const MAX_TRACKED_CLIENTS: usize = 1024;
+const MAX_TRACKED_CLIENTS: usize = 10_000;
+/// Retention period for failed-attempt entries with no activity.
+const FAILED_ATTEMPT_RETENTION_SECS: u64 = 900; // 15 min
+/// Minimum interval between full sweeps of the failed-attempt map.
+const FAILED_ATTEMPT_SWEEP_INTERVAL_SECS: u64 = 300; // 5 min
+/// Display length for stable paired-device IDs derived from token hash prefix.
+const DEVICE_ID_PREFIX_LEN: usize = 16;
 
-/// Per-client failed attempt counter with optional lockout timestamp.
-type FailedAttempts = HashMap<String, (u32, Option<Instant>)>;
+/// Per-client failed attempt state with optional absolute lockout deadline.
+#[derive(Debug, Clone, Copy)]
+struct FailedAttemptState {
+    count: u32,
+    lockout_until: Option<Instant>,
+    last_attempt: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PairedDeviceMeta {
+    created_at: Option<String>,
+    last_seen_at: Option<String>,
+    paired_by: Option<String>,
+}
+
+impl PairedDeviceMeta {
+    fn legacy() -> Self {
+        Self {
+            created_at: None,
+            last_seen_at: None,
+            paired_by: None,
+        }
+    }
+
+    fn fresh(paired_by: Option<String>) -> Self {
+        let now = now_rfc3339();
+        Self {
+            created_at: Some(now.clone()),
+            last_seen_at: Some(now),
+            paired_by,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PairedDevice {
+    pub id: String,
+    pub token_fingerprint: String,
+    pub created_at: Option<String>,
+    pub last_seen_at: Option<String>,
+    pub paired_by: Option<String>,
+}
 
 /// Manages pairing state for the gateway.
 ///
@@ -38,8 +84,10 @@ pub struct PairingGuard {
     pairing_code: Arc<Mutex<Option<String>>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
     paired_tokens: Arc<Mutex<HashSet<String>>>,
-    /// Brute-force protection: per-client failed attempt counter + lockout time.
-    failed_attempts: Arc<Mutex<FailedAttempts>>,
+    /// Non-secret per-device metadata keyed by token hash.
+    paired_device_meta: Arc<Mutex<HashMap<String, PairedDeviceMeta>>>,
+    /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
+    failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
 }
 
 impl PairingGuard {
@@ -62,6 +110,10 @@ impl PairingGuard {
                 }
             })
             .collect();
+        let paired_device_meta: HashMap<String, PairedDeviceMeta> = tokens
+            .iter()
+            .map(|hash| (hash.clone(), PairedDeviceMeta::legacy()))
+            .collect();
         let code = if require_pairing && tokens.is_empty() {
             Some(generate_code())
         } else {
@@ -71,7 +123,8 @@ impl PairingGuard {
             require_pairing,
             pairing_code: Arc::new(Mutex::new(code)),
             paired_tokens: Arc::new(Mutex::new(tokens)),
-            failed_attempts: Arc::new(Mutex::new(HashMap::new())),
+            paired_device_meta: Arc::new(Mutex::new(paired_device_meta)),
+            failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
         }
     }
 
@@ -86,15 +139,29 @@ impl PairingGuard {
     }
 
     fn try_pair_blocking(&self, code: &str, client_id: &str) -> Result<Option<String>, u64> {
-        // Check brute force lockout for this specific client
+        let client_id = normalize_client_key(client_id);
+        let now = Instant::now();
+
+        // Periodic sweep + lockout check
         {
-            let attempts = self.failed_attempts.lock();
-            if let Some((count, Some(locked_at))) = attempts.get(client_id) {
-                if *count >= MAX_PAIR_ATTEMPTS {
-                    let elapsed = locked_at.elapsed().as_secs();
-                    if elapsed < PAIR_LOCKOUT_SECS {
-                        return Err(PAIR_LOCKOUT_SECS - elapsed);
+            let mut guard = self.failed_attempts.lock();
+            let (ref mut map, ref mut last_sweep) = *guard;
+
+            // Sweep stale entries on interval
+            if now.duration_since(*last_sweep).as_secs() >= FAILED_ATTEMPT_SWEEP_INTERVAL_SECS {
+                prune_failed_attempts(map, now);
+                *last_sweep = now;
+            }
+
+            // Check brute force lockout for this specific client
+            if let Some(state) = map.get(&client_id) {
+                if let Some(until) = state.lockout_until {
+                    if now < until {
+                        let remaining = (until - now).as_secs();
+                        return Err(remaining.max(1));
                     }
+                    // Lockout expired — reset inline
+                    map.remove(&client_id);
                 }
             }
         }
@@ -105,12 +172,20 @@ impl PairingGuard {
                 if constant_time_eq(code.trim(), expected.trim()) {
                     // Reset failed attempts for this client on success
                     {
-                        let mut attempts = self.failed_attempts.lock();
-                        attempts.remove(client_id);
+                        let mut guard = self.failed_attempts.lock();
+                        guard.0.remove(&client_id);
                     }
                     let token = generate_token();
+                    let hashed_token = hash_token(&token);
                     let mut tokens = self.paired_tokens.lock();
-                    tokens.insert(hash_token(&token));
+                    tokens.insert(hashed_token.clone());
+                    drop(tokens);
+
+                    let mut metadata = self.paired_device_meta.lock();
+                    metadata.insert(
+                        hashed_token,
+                        PairedDeviceMeta::fresh(Some(client_id.clone())),
+                    );
 
                     // Consume the pairing code so it cannot be reused
                     *pairing_code = None;
@@ -122,27 +197,35 @@ impl PairingGuard {
 
         // Increment failed attempts for this client
         {
-            let mut attempts = self.failed_attempts.lock();
+            let mut guard = self.failed_attempts.lock();
+            let (ref mut map, _) = *guard;
 
-            // Evict expired entries when approaching the bound
-            if attempts.len() >= MAX_TRACKED_CLIENTS {
-                attempts.retain(|_, (_, locked_at)| {
-                    locked_at
-                        .map(|t| t.elapsed().as_secs() < PAIR_LOCKOUT_SECS)
-                        .unwrap_or(true)
-                });
+            // Enforce capacity bound: prune stale first, then LRU-evict if still full
+            if map.len() >= MAX_TRACKED_CLIENTS {
+                prune_failed_attempts(map, now);
             }
-
-            let entry = attempts.entry(client_id.to_string()).or_insert((0, None));
-            // Reset if previous lockout has expired
-            if let Some(locked_at) = entry.1 {
-                if locked_at.elapsed().as_secs() >= PAIR_LOCKOUT_SECS {
-                    *entry = (0, None);
+            if map.len() >= MAX_TRACKED_CLIENTS {
+                // Evict the least-recently-active entry
+                if let Some(lru_key) = map
+                    .iter()
+                    .min_by_key(|(_, s)| s.last_attempt)
+                    .map(|(k, _)| k.clone())
+                {
+                    map.remove(&lru_key);
                 }
             }
-            entry.0 += 1;
-            if entry.0 >= MAX_PAIR_ATTEMPTS {
-                entry.1 = Some(Instant::now());
+
+            let entry = map.entry(client_id).or_insert(FailedAttemptState {
+                count: 0,
+                lockout_until: None,
+                last_attempt: now,
+            });
+
+            entry.last_attempt = now;
+            entry.count += 1;
+
+            if entry.count >= MAX_PAIR_ATTEMPTS {
+                entry.lockout_until = Some(now + std::time::Duration::from_secs(PAIR_LOCKOUT_SECS));
             }
         }
 
@@ -159,9 +242,13 @@ impl PairingGuard {
         // TODO: make this function the main one without spawning a task
         let handle = tokio::task::spawn_blocking(move || this.try_pair_blocking(&code, &client_id));
 
-        handle
-            .await
-            .expect("failed to spawn blocking task this should not happen")
+        match handle.await {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::error!("pairing worker task failed: {err}");
+                Ok(None)
+            }
+        }
     }
 
     /// Check if a bearer token is valid (compares against stored hashes).
@@ -170,8 +257,21 @@ impl PairingGuard {
             return true;
         }
         let hashed = hash_token(token);
-        let tokens = self.paired_tokens.lock();
-        tokens.contains(&hashed)
+        let is_valid = {
+            let tokens = self.paired_tokens.lock();
+            tokens.contains(&hashed)
+        };
+
+        if is_valid {
+            let mut metadata = self.paired_device_meta.lock();
+            let now = now_rfc3339();
+            let entry = metadata
+                .entry(hashed)
+                .or_insert_with(PairedDeviceMeta::legacy);
+            entry.last_seen_at = Some(now);
+        }
+
+        is_valid
     }
 
     /// Returns true if the gateway is already paired (has at least one token).
@@ -185,6 +285,105 @@ impl PairingGuard {
         let tokens = self.paired_tokens.lock();
         tokens.iter().cloned().collect()
     }
+
+    /// List paired devices with non-secret metadata for dashboard management.
+    pub fn paired_devices(&self) -> Vec<PairedDevice> {
+        let token_hashes: Vec<String> = {
+            let tokens = self.paired_tokens.lock();
+            tokens.iter().cloned().collect()
+        };
+        let metadata = self.paired_device_meta.lock();
+
+        let mut devices: Vec<PairedDevice> = token_hashes
+            .into_iter()
+            .map(|hash| {
+                let meta = metadata
+                    .get(&hash)
+                    .cloned()
+                    .unwrap_or_else(PairedDeviceMeta::legacy);
+                let id = device_id_from_hash(&hash);
+                PairedDevice {
+                    id: id.clone(),
+                    token_fingerprint: id,
+                    created_at: meta.created_at,
+                    last_seen_at: meta.last_seen_at,
+                    paired_by: meta.paired_by,
+                }
+            })
+            .collect();
+
+        devices.sort_by(|a, b| {
+            b.last_seen_at
+                .cmp(&a.last_seen_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        devices
+    }
+
+    /// Revoke a paired device by short ID (hash prefix) or full token hash.
+    ///
+    /// Returns true when a device token was removed.
+    pub fn revoke_device(&self, device_id: &str) -> bool {
+        let requested = device_id.trim();
+        if requested.is_empty() {
+            return false;
+        }
+
+        let mut tokens = self.paired_tokens.lock();
+        let token_hash = tokens
+            .iter()
+            .find(|hash| {
+                let hash = hash.as_str();
+                hash == requested || device_id_from_hash(hash) == requested
+            })
+            .cloned();
+
+        let Some(token_hash) = token_hash else {
+            return false;
+        };
+
+        let removed = tokens.remove(&token_hash);
+        let tokens_empty = tokens.is_empty();
+        drop(tokens);
+
+        if removed {
+            self.paired_device_meta.lock().remove(&token_hash);
+            if self.require_pairing && tokens_empty {
+                let mut code = self.pairing_code.lock();
+                if code.is_none() {
+                    *code = Some(generate_code());
+                }
+            }
+        }
+
+        removed
+    }
+}
+
+/// Normalize a client identifier: trim whitespace, map empty to `"unknown"`.
+fn normalize_client_key(key: &str) -> String {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn device_id_from_hash(hash: &str) -> String {
+    hash.chars().take(DEVICE_ID_PREFIX_LEN).collect()
+}
+
+/// Remove failed-attempt entries whose `last_attempt` is older than the retention window.
+fn prune_failed_attempts(map: &mut HashMap<String, FailedAttemptState>, now: Instant) {
+    map.retain(|_, state| {
+        now.duration_since(state.last_attempt).as_secs() < FAILED_ATTEMPT_RETENTION_SECS
+    });
 }
 
 /// Generate a 6-digit numeric pairing code using cryptographically secure randomness.
@@ -366,6 +565,44 @@ mod tests {
         assert!(!guard.is_authenticated("wrong"));
     }
 
+    #[test]
+    async fn paired_devices_and_revoke_device_roundtrip() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+        assert!(guard.is_authenticated(&token));
+
+        let devices = guard.paired_devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].paired_by.as_deref(), Some("test_client"));
+        assert!(devices[0].created_at.is_some());
+        assert!(devices[0].last_seen_at.is_some());
+
+        let revoked = guard.revoke_device(&devices[0].id);
+        assert!(revoked, "revoke should remove the paired token");
+        assert!(!guard.is_authenticated(&token));
+        assert!(!guard.is_paired());
+        assert!(
+            guard.pairing_code().is_some(),
+            "revoke of final device should regenerate one-time pairing code"
+        );
+    }
+
+    #[test]
+    async fn authenticate_updates_legacy_device_last_seen() {
+        let token = "zc_valid";
+        let token_hash = hash_token(token);
+        let guard = PairingGuard::new(true, &[token_hash]);
+        let before = guard.paired_devices();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].last_seen_at.is_none());
+
+        assert!(guard.is_authenticated(token));
+
+        let after = guard.paired_devices();
+        assert!(after[0].last_seen_at.is_some());
+    }
+
     // ── Token hashing ────────────────────────────────────────
 
     #[test]
@@ -518,6 +755,122 @@ mod tests {
         assert!(
             err >= PAIR_LOCKOUT_SECS - 1,
             "Remaining lockout should be ~{PAIR_LOCKOUT_SECS}s, got {err}s"
+        );
+    }
+
+    #[test]
+    async fn successful_pair_resets_only_requesting_client_state() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let client_a = "client_a";
+        let client_b = "client_b";
+
+        // Both clients fail a few times
+        for _ in 0..3 {
+            let _ = guard.try_pair("wrong", client_a).await;
+            let _ = guard.try_pair("wrong", client_b).await;
+        }
+
+        // client_a pairs successfully — only its state should reset
+        let result = guard.try_pair(&code, client_a).await.unwrap();
+        assert!(result.is_some(), "client_a should pair successfully");
+
+        // client_b's failed count should still be intact (3 failures recorded)
+        let state = guard.failed_attempts.lock();
+        let b_state = state.0.get(client_b);
+        assert!(b_state.is_some(), "client_b state should still exist");
+        assert_eq!(
+            b_state.unwrap().count,
+            3,
+            "client_b should still have 3 failures"
+        );
+
+        // client_a should have been removed
+        assert!(
+            !state.0.contains_key(client_a),
+            "client_a state should be cleared"
+        );
+    }
+
+    #[test]
+    async fn failed_attempt_state_is_bounded_by_max_clients() {
+        let guard = PairingGuard::new(true, &[]);
+
+        // Fill the map to MAX_TRACKED_CLIENTS with stale entries
+        {
+            let mut state = guard.failed_attempts.lock();
+            let past = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(
+                    FAILED_ATTEMPT_RETENTION_SECS + 60,
+                ))
+                .unwrap_or_else(Instant::now);
+            for i in 0..MAX_TRACKED_CLIENTS {
+                state.0.insert(
+                    format!("stale_client_{i}"),
+                    FailedAttemptState {
+                        count: 1,
+                        lockout_until: None,
+                        last_attempt: past,
+                    },
+                );
+            }
+        }
+
+        // A new client triggers an attempt — should prune stale entries and fit
+        let result = guard.try_pair("wrong", "new_client").await;
+        assert!(result.is_ok(), "New client should not be blocked");
+
+        let state = guard.failed_attempts.lock();
+        assert!(
+            state.0.len() <= MAX_TRACKED_CLIENTS,
+            "Map size should stay within bound, got {}",
+            state.0.len()
+        );
+        assert!(
+            state.0.contains_key("new_client"),
+            "New client should be tracked"
+        );
+    }
+
+    #[test]
+    async fn failed_attempt_sweep_prunes_expired_clients() {
+        let guard = PairingGuard::new(true, &[]);
+
+        // Seed a stale entry and set last_sweep to long ago so sweep triggers
+        {
+            let mut state = guard.failed_attempts.lock();
+            let past = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(
+                    FAILED_ATTEMPT_RETENTION_SECS + 60,
+                ))
+                .unwrap_or_else(Instant::now);
+            state.0.insert(
+                "stale_client".to_string(),
+                FailedAttemptState {
+                    count: 2,
+                    lockout_until: None,
+                    last_attempt: past,
+                },
+            );
+            // Force last_sweep to be old enough to trigger sweep
+            state.1 = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(
+                    FAILED_ATTEMPT_SWEEP_INTERVAL_SECS + 1,
+                ))
+                .unwrap_or_else(Instant::now);
+        }
+
+        // Any attempt triggers sweep
+        let _ = guard.try_pair("wrong", "fresh_client").await;
+
+        let state = guard.failed_attempts.lock();
+        assert!(
+            !state.0.contains_key("stale_client"),
+            "Stale client should have been pruned by sweep"
+        );
+        assert!(
+            state.0.contains_key("fresh_client"),
+            "Fresh client should still be tracked"
         );
     }
 

@@ -1,10 +1,28 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::file_link_guard::has_multiple_hard_links;
+use crate::security::sensitive_paths::is_sensitive_file_path;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+
+fn sensitive_file_block_message(path: &str) -> String {
+    format!(
+        "Reading sensitive file '{path}' is blocked by policy. \
+Set [autonomy].allow_sensitive_file_reads = true only when strictly necessary."
+    )
+}
+
+fn hard_link_block_message(path: &Path) -> String {
+    format!(
+        "Reading multiply-linked file '{}' is blocked by policy \
+(potential hard-link escape).",
+        path.display()
+    )
+}
 
 /// Read file contents with path sandboxing
 pub struct FileReadTool {
@@ -24,7 +42,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion."
+        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion. Sensitive files (for example .env and key material) are blocked by default."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -71,6 +89,14 @@ impl Tool for FileReadTool {
             });
         }
 
+        if !self.security.allow_sensitive_file_reads && is_sensitive_file_path(Path::new(path)) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(sensitive_file_block_message(path)),
+            });
+        }
+
         // Record action BEFORE canonicalization so that every non-trivially-rejected
         // request consumes rate limit budget. This prevents attackers from probing
         // path existence (via canonicalize errors) without rate limit cost.
@@ -82,7 +108,7 @@ impl Tool for FileReadTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_user_supplied_path(path);
 
         // Resolve path before reading to block symlink escapes.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
@@ -107,9 +133,27 @@ impl Tool for FileReadTool {
             });
         }
 
+        if !self.security.allow_sensitive_file_reads && is_sensitive_file_path(&resolved_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(sensitive_file_block_message(
+                    &resolved_path.display().to_string(),
+                )),
+            });
+        }
+
         // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
         match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => {
+                if has_multiple_hard_links(&meta) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(hard_link_block_message(&resolved_path)),
+                    });
+                }
+
                 if meta.len() > MAX_FILE_SIZE_BYTES {
                     return Ok(ToolResult {
                         success: false,
@@ -259,6 +303,18 @@ mod tests {
         })
     }
 
+    fn test_security_allows_outside_workspace(
+        workspace: std::path::PathBuf,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: false,
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[test]
     fn file_read_name() {
         let tool = FileReadTool::new(test_security(std::env::temp_dir()));
@@ -339,6 +395,154 @@ mod tests {
         let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn file_read_expands_tilde_path_consistently_with_policy() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME should be available for tilde expansion tests");
+        let target_rel = format!("zeroclaw_tilde_read_{}.txt", uuid::Uuid::new_v4());
+        let target_path = home.join(&target_rel);
+        let _ = tokio::fs::remove_file(&target_path).await;
+        tokio::fs::write(&target_path, "tilde-read").await.unwrap();
+
+        let workspace = std::env::temp_dir().join("zeroclaw_test_file_read_tilde_workspace");
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let tool = FileReadTool::new(test_security_allows_outside_workspace(workspace.clone()));
+        let result = tool
+            .execute(json!({"path": format!("~/{}", target_rel)}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "tilde path read should succeed when policy allows outside workspace: {:?}",
+            result.error
+        );
+        assert!(result.output.contains("1: tilde-read"));
+
+        let _ = tokio::fs::remove_file(&target_path).await;
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_blocks_sensitive_env_file_by_default() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_sensitive_env");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join(".env"), "API_KEY=plaintext-secret")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": ".env"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("sensitive file"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_blocks_sensitive_dotenv_variant_by_default() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_sensitive_env_variant");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join(".env.production"), "API_KEY=plaintext-secret")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": ".env.production"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("sensitive file"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_blocks_sensitive_directory_credentials_by_default() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_sensitive_aws");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(dir.join(".aws")).await.unwrap();
+        tokio::fs::write(dir.join(".aws/credentials"), "aws_access_key_id=abc")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": ".aws/credentials"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("sensitive file"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_allows_sensitive_file_when_policy_enabled() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_sensitive_allowed");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join(".env"), "SAFE=value")
+            .await
+            .unwrap();
+
+        let policy = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: dir.clone(),
+            allow_sensitive_file_reads: true,
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(policy);
+        let result = tool.execute(json!({"path": ".env"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("1: SAFE=value"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_allows_sensitive_nested_path_when_policy_enabled() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_sensitive_nested_allowed");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(dir.join(".aws")).await.unwrap();
+        tokio::fs::write(dir.join(".aws/credentials"), "aws_access_key_id=allowed")
+            .await
+            .unwrap();
+
+        let policy = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: dir.clone(),
+            allow_sensitive_file_reads: true,
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(policy);
+        let result = tool
+            .execute(json!({"path": ".aws/credentials"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("1: aws_access_key_id=allowed"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
@@ -461,8 +665,37 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn file_read_outside_workspace_guides_allowed_roots() {
+    async fn file_read_blocks_hardlink_escape() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_read_hardlink_escape");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        tokio::fs::write(outside.join("secret.txt"), "outside workspace")
+            .await
+            .unwrap();
+        std::fs::hard_link(outside.join("secret.txt"), workspace.join("alias.txt")).unwrap();
+
+        let tool = FileReadTool::new(test_security(workspace.clone()));
+        let result = tool.execute(json!({"path": "alias.txt"})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("hard-link escape"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_outside_workspace_allowed_when_workspace_only_disabled() {
         let root = std::env::temp_dir().join("zeroclaw_test_file_read_allowed_roots_hint");
         let workspace = root.join("workspace");
         let outside = root.join("outside");
@@ -487,10 +720,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!result.success);
-        let error = result.error.unwrap_or_default();
-        assert!(error.contains("escapes workspace"));
-        assert!(error.contains("allowed_roots"));
+        assert!(result.success);
+        assert!(result.error.is_none());
+        assert!(result.output.contains("outside"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
@@ -744,6 +976,10 @@ mod tests {
                         text: Some("done".into()),
                         tool_calls: vec![],
                         usage: None,
+                        reasoning_content: None,
+                        quota_metadata: None,
+                        stop_reason: None,
+                        raw_stop_reason: None,
                     });
                 }
                 Ok(guard.remove(0))
@@ -803,12 +1039,20 @@ mod tests {
                     arguments: r#"{"path": "report.pdf"}"#.into(),
                 }],
                 usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             },
             // Turn 1 continued: provider sees tool result and answers
             ChatResponse {
                 text: Some("The PDF contains a greeting: Hello PDF".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             },
         ]);
 
@@ -894,11 +1138,19 @@ mod tests {
                     arguments: r#"{"path": "data.bin"}"#.into(),
                 }],
                 usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             },
             ChatResponse {
                 text: Some("The file appears to be binary data.".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             },
         ]);
 
@@ -982,7 +1234,8 @@ mod tests {
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
         // ── Real provider (OpenAI Codex uses XML tool dispatch) ──
-        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default());
+        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default(), None)
+            .expect("provider should initialize");
 
         let mut agent = Agent::builder()
             .provider(Box::new(provider) as Box<dyn Provider>)

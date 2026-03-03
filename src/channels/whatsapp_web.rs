@@ -34,6 +34,127 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::select;
 
+// ── Media attachment support ──────────────────────────────────────────
+
+/// Supported WhatsApp media attachment kinds.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy)]
+enum WaAttachmentKind {
+    Image,
+    Document,
+    Video,
+    Audio,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WaAttachmentKind {
+    /// Parse from the marker prefix (case-insensitive).
+    fn from_marker(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "IMAGE" => Some(Self::Image),
+            "DOCUMENT" => Some(Self::Document),
+            "VIDEO" => Some(Self::Video),
+            "AUDIO" => Some(Self::Audio),
+            _ => None,
+        }
+    }
+
+    /// Map to the wa-rs `MediaType` used for upload encryption.
+    fn media_type(self) -> wa_rs_core::download::MediaType {
+        match self {
+            Self::Image => wa_rs_core::download::MediaType::Image,
+            Self::Document => wa_rs_core::download::MediaType::Document,
+            Self::Video => wa_rs_core::download::MediaType::Video,
+            Self::Audio => wa_rs_core::download::MediaType::Audio,
+        }
+    }
+}
+
+/// A parsed media attachment from `[KIND:path]` markers in the response text.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone)]
+struct WaAttachment {
+    kind: WaAttachmentKind,
+    target: String,
+}
+
+/// Parse `[IMAGE:/path]`, `[DOCUMENT:/path]`, etc. markers out of a message.
+/// Returns the cleaned text (markers removed) and a vec of attachments.
+#[cfg(feature = "whatsapp-web")]
+fn parse_wa_attachment_markers(message: &str) -> (String, Vec<WaAttachment>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < message.len() {
+        let Some(open_rel) = message[cursor..].find('[') else {
+            cleaned.push_str(&message[cursor..]);
+            break;
+        };
+
+        let open = cursor + open_rel;
+        cleaned.push_str(&message[cursor..open]);
+
+        let Some(close_rel) = message[open..].find(']') else {
+            cleaned.push_str(&message[open..]);
+            break;
+        };
+
+        let close = open + close_rel;
+        let marker = &message[open + 1..close];
+
+        let parsed = marker.split_once(':').and_then(|(kind, target)| {
+            let kind = WaAttachmentKind::from_marker(kind)?;
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(WaAttachment {
+                kind,
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        } else {
+            // Not a valid media marker — keep the original text.
+            cleaned.push_str(&message[open..=close]);
+        }
+
+        cursor = close + 1;
+    }
+
+    (cleaned.trim().to_string(), attachments)
+}
+
+/// Infer MIME type from file extension.
+#[cfg(feature = "whatsapp-web")]
+fn mime_from_path(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "ogg" | "opus" => "audio/ogg",
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    }
+}
+
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
 /// # Status: Functional Implementation
@@ -64,6 +185,8 @@ pub struct WhatsAppWebChannel {
     client: Arc<Mutex<Option<Arc<wa_rs::Client>>>>,
     /// Message sender channel
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
+    /// Voice transcription configuration (Groq Whisper)
+    transcription: Option<crate::config::TranscriptionConfig>,
 }
 
 impl WhatsAppWebChannel {
@@ -90,6 +213,43 @@ impl WhatsAppWebChannel {
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
+            transcription: None,
+        }
+    }
+
+    /// Configure voice transcription via Groq Whisper.
+    ///
+    /// When `config.enabled` is false the builder is a no-op so callers can
+    /// pass `config.transcription.clone()` unconditionally.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
+        self
+    }
+
+    /// Map a WhatsApp audio MIME type to a filename accepted by the Groq Whisper API.
+    ///
+    /// WhatsApp voice notes are typically `audio/ogg; codecs=opus`.
+    /// MIME parameters (e.g. `; codecs=opus`) are stripped before matching so that
+    /// `audio/webm; codecs=opus` maps to `voice.webm`, not `voice.opus`.
+    #[cfg(feature = "whatsapp-web")]
+    fn audio_mime_to_filename(mime: &str) -> &'static str {
+        let base = mime
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        match base.as_str() {
+            "audio/ogg" | "audio/oga" => "voice.ogg",
+            "audio/webm" => "voice.webm",
+            "audio/opus" => "voice.opus",
+            "audio/mp4" | "audio/m4a" | "audio/aac" => "voice.m4a",
+            "audio/mpeg" | "audio/mp3" => "voice.mp3",
+            "audio/wav" | "audio/x-wav" => "voice.wav",
+            _ => "voice.ogg",
         }
     }
 
@@ -121,6 +281,23 @@ impl WhatsAppWebChannel {
         recipient.trim().contains('@')
     }
 
+    /// Render a WhatsApp pairing QR payload into terminal-friendly text.
+    #[cfg(feature = "whatsapp-web")]
+    fn render_pairing_qr(code: &str) -> Result<String> {
+        let payload = code.trim();
+        if payload.is_empty() {
+            anyhow::bail!("QR payload is empty");
+        }
+
+        let qr = qrcode::QrCode::new(payload.as_bytes())
+            .map_err(|err| anyhow!("Failed to encode WhatsApp Web QR payload: {err}"))?;
+
+        Ok(qr
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build())
+    }
+
     /// Convert a recipient to a wa-rs JID.
     ///
     /// Supports:
@@ -145,6 +322,108 @@ impl WhatsAppWebChannel {
         }
 
         Ok(wa_rs_binary::jid::Jid::pn(digits))
+    }
+
+    /// Upload a file to WhatsApp media servers and send it as the appropriate message type.
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_media_attachment(
+        &self,
+        client: &Arc<wa_rs::Client>,
+        to: &wa_rs_binary::jid::Jid,
+        attachment: &WaAttachment,
+    ) -> Result<()> {
+        use std::path::Path;
+
+        let path = Path::new(&attachment.target);
+        if !path.exists() {
+            anyhow::bail!("Media file not found: {}", attachment.target);
+        }
+
+        let data = tokio::fs::read(path).await?;
+        let file_len = data.len() as u64;
+        let mimetype = mime_from_path(path).to_string();
+
+        tracing::info!(
+            "WhatsApp Web: uploading {:?} ({} bytes, {})",
+            attachment.kind,
+            file_len,
+            mimetype
+        );
+
+        let upload = client.upload(data, attachment.kind.media_type()).await?;
+
+        let outgoing = match attachment.kind {
+            WaAttachmentKind::Image => wa_rs_proto::whatsapp::Message {
+                image_message: Some(Box::new(wa_rs_proto::whatsapp::message::ImageMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some(mimetype),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            WaAttachmentKind::Document => {
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+                wa_rs_proto::whatsapp::Message {
+                    document_message: Some(Box::new(
+                        wa_rs_proto::whatsapp::message::DocumentMessage {
+                            url: Some(upload.url),
+                            direct_path: Some(upload.direct_path),
+                            media_key: Some(upload.media_key),
+                            file_enc_sha256: Some(upload.file_enc_sha256),
+                            file_sha256: Some(upload.file_sha256),
+                            file_length: Some(upload.file_length),
+                            mimetype: Some(mimetype),
+                            file_name: Some(file_name),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }
+            }
+            WaAttachmentKind::Video => wa_rs_proto::whatsapp::Message {
+                video_message: Some(Box::new(wa_rs_proto::whatsapp::message::VideoMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some(mimetype),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            WaAttachmentKind::Audio => wa_rs_proto::whatsapp::Message {
+                audio_message: Some(Box::new(wa_rs_proto::whatsapp::message::AudioMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some(mimetype),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        };
+
+        let msg_id = client.send_message(to.clone(), outgoing).await?;
+        tracing::info!(
+            "WhatsApp Web: sent {:?} media (id: {})",
+            attachment.kind,
+            msg_id
+        );
+        Ok(())
     }
 }
 
@@ -174,17 +453,59 @@ impl Channel for WhatsAppWebChannel {
         }
 
         let to = self.recipient_to_jid(&message.recipient)?;
-        let outgoing = wa_rs_proto::whatsapp::Message {
-            conversation: Some(message.content.clone()),
-            ..Default::default()
-        };
 
-        let message_id = client.send_message(to, outgoing).await?;
-        tracing::debug!(
-            "WhatsApp Web: sent message to {} (id: {})",
-            message.recipient,
-            message_id
-        );
+        // Parse media attachment markers from the response text.
+        let (text_without_markers, attachments) = parse_wa_attachment_markers(&message.content);
+
+        // Send any text portion first.
+        if !text_without_markers.is_empty() {
+            let text_msg = wa_rs_proto::whatsapp::Message {
+                conversation: Some(text_without_markers.clone()),
+                ..Default::default()
+            };
+            let msg_id = client.send_message(to.clone(), text_msg).await?;
+            tracing::debug!(
+                "WhatsApp Web: sent text to {} (id: {})",
+                message.recipient,
+                msg_id
+            );
+        }
+
+        // Send each media attachment.
+        for attachment in &attachments {
+            if let Err(e) = self.send_media_attachment(&client, &to, attachment).await {
+                tracing::error!(
+                    "WhatsApp Web: failed to send {:?} attachment {}: {}",
+                    attachment.kind,
+                    attachment.target,
+                    e
+                );
+                // Fall back to sending the path as text so the user knows something went wrong.
+                let fallback = wa_rs_proto::whatsapp::Message {
+                    conversation: Some(format!("[Failed to send media: {}]", attachment.target)),
+                    ..Default::default()
+                };
+                let _ = client.send_message(to.clone(), fallback).await;
+            }
+        }
+
+        // If there were no markers and no text (shouldn't happen), send original content.
+        if attachments.is_empty()
+            && text_without_markers.is_empty()
+            && !message.content.trim().is_empty()
+        {
+            let outgoing = wa_rs_proto::whatsapp::Message {
+                conversation: Some(message.content.clone()),
+                ..Default::default()
+            };
+            let message_id = client.send_message(to, outgoing).await?;
+            tracing::debug!(
+                "WhatsApp Web: sent message to {} (id: {})",
+                message.recipient,
+                message_id
+            );
+        }
+
         Ok(())
     }
 
@@ -237,6 +558,7 @@ impl Channel for WhatsAppWebChannel {
         // Build the bot
         let tx_clone = tx.clone();
         let allowed_numbers = self.allowed_numbers.clone();
+        let transcription = self.transcription.clone();
 
         let mut builder = Bot::builder()
             .with_backend(backend)
@@ -245,6 +567,7 @@ impl Channel for WhatsAppWebChannel {
             .on_event(move |event, _client| {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
+                let transcription = transcription.clone();
                 async move {
                     match event {
                         Event::Message(msg, info) => {
@@ -269,13 +592,82 @@ impl Channel for WhatsAppWebChannel {
 
                             if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
                                 let trimmed = text.trim();
-                                if trimmed.is_empty() {
+                                let content = if !trimmed.is_empty() {
+                                    trimmed.to_string()
+                                } else if let Some(ref tc) = transcription {
+                                    // Attempt to transcribe audio/voice messages
+                                    if let Some(ref audio_msg) = msg.audio_message {
+                                        let duration_secs =
+                                            audio_msg.seconds.unwrap_or(0) as u64;
+                                        if duration_secs > tc.max_duration_secs {
+                                            tracing::info!(
+                                                "WhatsApp Web: voice message too long \
+                                                 ({duration_secs}s > {}s), skipping",
+                                                tc.max_duration_secs
+                                            );
+                                            return;
+                                        }
+                                        let mime = audio_msg
+                                            .mimetype
+                                            .as_deref()
+                                            .unwrap_or("audio/ogg");
+                                        let file_name =
+                                            Self::audio_mime_to_filename(mime);
+                                        // download() decrypts the media in one step.
+                                        // audio_msg is Box<AudioMessage>; .as_ref() yields
+                                        // &AudioMessage which implements Downloadable.
+                                        match _client.download(audio_msg.as_ref()).await {
+                                            Ok(audio_bytes) => {
+                                                match super::transcription::transcribe_audio(
+                                                    audio_bytes,
+                                                    file_name,
+                                                    tc,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(t) if !t.trim().is_empty() => {
+                                                        format!("[Voice] {}", t.trim())
+                                                    }
+                                                    Ok(_) => {
+                                                        tracing::info!(
+                                                            "WhatsApp Web: voice transcription \
+                                                             returned empty text, skipping"
+                                                        );
+                                                        return;
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "WhatsApp Web: voice transcription \
+                                                             failed: {e}"
+                                                        );
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "WhatsApp Web: failed to download voice \
+                                                     audio: {e}"
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        tracing::debug!(
+                                            "WhatsApp Web: ignoring non-text/non-audio \
+                                             message from {}",
+                                            normalized
+                                        );
+                                        return;
+                                    }
+                                } else {
                                     tracing::debug!(
-                                        "WhatsApp Web: ignoring empty or non-text message from {}",
+                                        "WhatsApp Web: ignoring empty or non-text message \
+                                         from {}",
                                         normalized
                                     );
                                     return;
-                                }
+                                };
 
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
@@ -284,7 +676,7 @@ impl Channel for WhatsAppWebChannel {
                                         sender: normalized.clone(),
                                         // Reply to the originating chat JID (DM or group).
                                         reply_target: chat,
-                                        content: trimmed.to_string(),
+                                        content,
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
                                     })
@@ -315,7 +707,23 @@ impl Channel for WhatsAppWebChannel {
                             tracing::info!(
                                 "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)"
                             );
-                            tracing::debug!("QR code: {}", code);
+                            match Self::render_pairing_qr(&code) {
+                                Ok(rendered) => {
+                                    eprintln!();
+                                    eprintln!(
+                                        "WhatsApp Web QR code (scan in WhatsApp > Linked Devices):"
+                                    );
+                                    eprintln!("{rendered}");
+                                    eprintln!();
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "WhatsApp Web: failed to render pairing QR in terminal: {}",
+                                        err
+                                    );
+                                    tracing::info!("WhatsApp Web QR payload: {}", code);
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -555,10 +963,132 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_render_pairing_qr_rejects_empty_payload() {
+        let err = WhatsAppWebChannel::render_pairing_qr("   ").expect_err("empty payload");
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_render_pairing_qr_outputs_multiline_text() {
+        let rendered =
+            WhatsAppWebChannel::render_pairing_qr("https://example.com/whatsapp-pairing")
+                .expect("rendered QR");
+        assert!(rendered.lines().count() > 10);
+        assert!(rendered.trim().len() > 64);
+    }
+
     #[tokio::test]
     #[cfg(feature = "whatsapp-web")]
     async fn whatsapp_web_health_check_disconnected() {
         let ch = make_channel();
         assert!(!ch.health_check().await);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn parse_wa_markers_image() {
+        let msg = "Here is the timeline [IMAGE:/tmp/chart.png]";
+        let (text, attachments) = parse_wa_attachment_markers(msg);
+        assert_eq!(text, "Here is the timeline");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].target, "/tmp/chart.png");
+        assert!(matches!(attachments[0].kind, WaAttachmentKind::Image));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn parse_wa_markers_multiple() {
+        let msg = "Text [IMAGE:/a.png] more [DOCUMENT:/b.pdf]";
+        let (text, attachments) = parse_wa_attachment_markers(msg);
+        assert_eq!(text, "Text  more");
+        assert_eq!(attachments.len(), 2);
+        assert!(matches!(attachments[0].kind, WaAttachmentKind::Image));
+        assert!(matches!(attachments[1].kind, WaAttachmentKind::Document));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn parse_wa_markers_no_markers() {
+        let msg = "Just regular text";
+        let (text, attachments) = parse_wa_attachment_markers(msg);
+        assert_eq!(text, "Just regular text");
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn parse_wa_markers_unknown_kind_preserved() {
+        let msg = "Check [UNKNOWN:/foo] out";
+        let (text, attachments) = parse_wa_attachment_markers(msg);
+        assert_eq!(text, "Check [UNKNOWN:/foo] out");
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_transcription_sets_config_when_enabled() {
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = true;
+        let ch = make_channel().with_transcription(tc);
+        assert!(ch.transcription.is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_transcription_skips_when_disabled() {
+        let tc = crate::config::TranscriptionConfig::default(); // enabled = false
+        let ch = make_channel().with_transcription(tc);
+        assert!(ch.transcription.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn audio_mime_to_filename_maps_whatsapp_voice_note() {
+        // WhatsApp voice notes typically use this MIME type
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/ogg; codecs=opus"),
+            "voice.ogg"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/ogg"),
+            "voice.ogg"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/opus"),
+            "voice.opus"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/mp4"),
+            "voice.m4a"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/mpeg"),
+            "voice.mp3"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/wav"),
+            "voice.wav"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/webm"),
+            "voice.webm"
+        );
+        // Regression: webm+opus codec parameter must not match the opus branch
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/webm; codecs=opus"),
+            "voice.webm"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/x-wav"),
+            "voice.wav"
+        );
+        // Unknown types default to ogg (safe default for WhatsApp voice notes)
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("application/octet-stream"),
+            "voice.ogg"
+        );
     }
 }

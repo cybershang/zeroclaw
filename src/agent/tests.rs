@@ -94,6 +94,10 @@ impl Provider for ScriptedProvider {
                 text: Some("done".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             });
         }
         Ok(guard.remove(0))
@@ -330,6 +334,10 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
         text: Some(String::new()),
         tool_calls: calls,
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -339,6 +347,10 @@ fn text_response(text: &str) -> ChatResponse {
         text: Some(text.into()),
         tool_calls: vec![],
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -350,6 +362,10 @@ fn xml_tool_response(name: &str, args: &str) -> ChatResponse {
         )),
         tool_calls: vec![],
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -628,7 +644,7 @@ async fn history_trims_after_max_messages() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn auto_save_stores_only_user_messages_in_memory() {
+async fn auto_save_stores_user_and_assistant_messages_in_memory() {
     let (mem, _tmp) = make_sqlite_memory();
     let provider = Box::new(ScriptedProvider::new(vec![text_response(
         "I remember everything",
@@ -643,11 +659,11 @@ async fn auto_save_stores_only_user_messages_in_memory() {
 
     let _ = agent.turn("Remember this fact").await.unwrap();
 
-    // Auto-save only persists user-stated input, never assistant-generated summaries.
+    // Auto-save persists both user input and assistant output for traceability.
     let count = mem.count().await.unwrap();
     assert_eq!(
-        count, 1,
-        "Expected exactly 1 user memory entry, got {count}"
+        count, 2,
+        "Expected user + assistant memory entries, got {count}"
     );
 
     let stored = mem.get("user_msg").await.unwrap();
@@ -660,8 +676,13 @@ async fn auto_save_stores_only_user_messages_in_memory() {
 
     let assistant = mem.get("assistant_resp").await.unwrap();
     assert!(
-        assistant.is_none(),
-        "assistant_resp should not be auto-saved anymore"
+        assistant.is_some(),
+        "Expected assistant_resp key to be present"
+    );
+    assert_eq!(
+        assistant.unwrap().content,
+        "I remember everything",
+        "Assistant response should be persisted when auto-save is enabled"
     );
 }
 
@@ -723,6 +744,20 @@ async fn native_dispatcher_sends_tool_specs() {
     assert!(dispatcher.should_send_tool_specs());
 }
 
+#[test]
+fn agent_tool_specs_accessor_exposes_registered_tools() {
+    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
+    let agent = build_agent_with(
+        provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let specs = agent.tool_specs();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].name, "echo");
+}
+
 #[tokio::test]
 async fn xml_dispatcher_does_not_send_tool_specs() {
     let dispatcher = XmlToolDispatcher;
@@ -739,6 +774,10 @@ async fn turn_handles_empty_text_response() {
         text: Some(String::new()),
         tool_calls: vec![],
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     }]));
 
     let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
@@ -753,6 +792,10 @@ async fn turn_handles_none_text_response() {
         text: None,
         tool_calls: vec![],
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     }]));
 
     let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
@@ -777,6 +820,10 @@ async fn turn_preserves_text_alongside_tool_calls() {
                 arguments: r#"{"message": "hi"}"#.into(),
             }],
             usage: None,
+            reasoning_content: None,
+            quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         },
         text_response("Here are the results"),
     ]));
@@ -894,6 +941,38 @@ async fn system_prompt_not_duplicated_on_second_turn() {
         .filter(|msg| matches!(msg, ConversationMessage::Chat(c) if c.role == "system"))
         .count();
     assert_eq!(system_count, 1, "System prompt should appear exactly once");
+}
+
+#[tokio::test]
+async fn system_prompt_datetime_refreshes_between_turns() {
+    let provider = Box::new(ScriptedProvider::new(vec![
+        text_response("first"),
+        text_response("second"),
+    ]));
+    let mut agent = build_agent_with(
+        provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let _ = agent.turn("hi").await.unwrap();
+    let first_prompt = match &agent.history()[0] {
+        ConversationMessage::Chat(c) if c.role == "system" => c.content.clone(),
+        _ => panic!("First history entry should be system prompt"),
+    };
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let _ = agent.turn("hello again").await.unwrap();
+    let second_prompt = match &agent.history()[0] {
+        ConversationMessage::Chat(c) if c.role == "system" => c.content.clone(),
+        _ => panic!("First history entry should be system prompt"),
+    };
+
+    assert_ne!(
+        first_prompt, second_prompt,
+        "System prompt datetime should refresh between turns"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1014,6 +1093,10 @@ async fn native_dispatcher_handles_stringified_arguments() {
             arguments: r#"{"message": "hello"}"#.into(),
         }],
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     };
 
     let (_, calls) = dispatcher.parse_response(&response);
@@ -1040,6 +1123,10 @@ fn xml_dispatcher_handles_nested_json() {
         ),
         tool_calls: vec![],
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     };
 
     let dispatcher = XmlToolDispatcher;
@@ -1058,6 +1145,10 @@ fn xml_dispatcher_handles_empty_tool_call_tag() {
         text: Some("<tool_call>\n</tool_call>\nSome text".into()),
         tool_calls: vec![],
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     };
 
     let dispatcher = XmlToolDispatcher;
@@ -1072,6 +1163,10 @@ fn xml_dispatcher_handles_unclosed_tool_call() {
         text: Some("Before\n<tool_call>\n{\"name\": \"shell\"}".into()),
         tool_calls: vec![],
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     };
 
     let dispatcher = XmlToolDispatcher;
@@ -1097,6 +1192,7 @@ fn conversation_message_serialization_roundtrip() {
                 name: "shell".into(),
                 arguments: "{}".into(),
             }],
+            reasoning_content: None,
         },
         ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "tc1".into(),
@@ -1119,10 +1215,12 @@ fn conversation_message_serialization_roundtrip() {
                 ConversationMessage::AssistantToolCalls {
                     text: a_text,
                     tool_calls: a_calls,
+                    ..
                 },
                 ConversationMessage::AssistantToolCalls {
                     text: b_text,
                     tool_calls: b_calls,
+                    ..
                 },
             ) => {
                 assert_eq!(a_text, b_text);
@@ -1219,6 +1317,7 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
                 name: "shell".into(),
                 arguments: "{}".into(),
             }],
+            reasoning_content: None,
         },
         ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "tc1".into(),

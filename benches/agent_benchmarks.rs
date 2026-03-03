@@ -9,7 +9,8 @@
 //!
 //! Ref: https://github.com/zeroclaw-labs/zeroclaw/issues/618 (item 7)
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 
 use zeroclaw::agent::agent::Agent;
@@ -39,6 +40,10 @@ impl BenchProvider {
                 text: Some(text.into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             }]),
         }
     }
@@ -54,11 +59,19 @@ impl BenchProvider {
                         arguments: "{}".into(),
                     }],
                     usage: None,
+                    reasoning_content: None,
+                    quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 },
                 ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
+                    reasoning_content: None,
+                    quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 },
             ]),
         }
@@ -89,6 +102,10 @@ impl Provider for BenchProvider {
                 text: Some("done".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             });
         }
         Ok(guard.remove(0))
@@ -155,6 +172,10 @@ Let me know if you need more."#
         ),
         tool_calls: vec![],
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     };
 
     let multi_tool = ChatResponse {
@@ -172,6 +193,10 @@ Let me know if you need more."#
         ),
         tool_calls: vec![],
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     };
 
     c.bench_function("xml_parse_single_tool_call", |b| {
@@ -205,6 +230,10 @@ fn bench_native_parsing(c: &mut Criterion) {
             },
         ],
         usage: None,
+        reasoning_content: None,
+        quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     };
 
     c.bench_function("native_parse_tool_calls", |b| {

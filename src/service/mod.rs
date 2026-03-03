@@ -391,6 +391,10 @@ fn install_macos(config: &Config) -> Result<()> {
     let stdout = logs_dir.join("daemon.stdout.log");
     let stderr = logs_dir.join("daemon.stderr.log");
 
+    // Forward provider-related env vars into the launchd plist so the daemon
+    // can refresh OAuth tokens and authenticate without manual intervention.
+    let env_block = build_launchd_env_vars();
+
     let plist = format!(
         r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
@@ -406,7 +410,7 @@ fn install_macos(config: &Config) -> Result<()> {
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <true/>{env_block}
   <key>StandardOutPath</key>
   <string>{stdout}</string>
   <key>StandardErrorPath</key>
@@ -416,6 +420,7 @@ fn install_macos(config: &Config) -> Result<()> {
 "#,
         label = SERVICE_LABEL,
         exe = xml_escape(&exe.display().to_string()),
+        env_block = env_block,
         stdout = xml_escape(&stdout.display().to_string()),
         stderr = xml_escape(&stderr.display().to_string())
     );
@@ -441,9 +446,11 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+    let env_lines = build_systemd_env_vars();
     let unit = format!(
-        "[Unit]\nDescription=ZeroClaw daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
-        exe.display()
+        "[Unit]\nDescription=ZeroClaw daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exe} daemon\nRestart=always\nRestartSec=3\n{env_lines}\n[Install]\nWantedBy=default.target\n",
+        exe = exe.display(),
+        env_lines = env_lines,
     );
 
     fs::write(&file, unit)?;
@@ -457,12 +464,25 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
 /// Check if the current process is running as root (Unix only)
 #[cfg(unix)]
 fn is_root() -> bool {
-    unsafe { libc::getuid() == 0 }
+    current_uid() == Some(0)
 }
 
 #[cfg(not(unix))]
 fn is_root() -> bool {
     false
+}
+
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    let output = Command::new("id").arg("-u").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
 }
 
 /// Check if the zeroclaw user exists and has expected properties.
@@ -1024,6 +1044,61 @@ fn install_windows(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Env vars to forward into the launchd / systemd service so that the daemon
+/// can refresh OAuth tokens and authenticate with providers automatically.
+const SERVICE_ENV_VARS: &[&str] = &[
+    "GEMINI_API_KEY",
+    "GEMINI_CLI_CLIENT_ID",
+    "GEMINI_CLI_CLIENT_SECRET",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENROUTER_API_KEY",
+];
+
+/// Build the `<key>EnvironmentVariables</key>` plist fragment from env vars
+/// present in the current process. Returns an empty string if none are set.
+fn build_launchd_env_vars() -> String {
+    let mut entries = Vec::new();
+    for &var in SERVICE_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                entries.push(format!(
+                    "    <key>{}</key>\n    <string>{}</string>",
+                    xml_escape(var),
+                    xml_escape(&val)
+                ));
+            }
+        }
+    }
+    if entries.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n  <key>EnvironmentVariables</key>\n  <dict>\n{}\n  </dict>",
+            entries.join("\n")
+        )
+    }
+}
+
+/// Build `Environment=` lines for a systemd unit from env vars present in the
+/// current process. Returns an empty string if none are set.
+fn build_systemd_env_vars() -> String {
+    let mut lines = Vec::new();
+    for &var in SERVICE_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                // systemd Environment values with special chars need quoting
+                lines.push(format!("Environment=\"{var}={val}\""));
+            }
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
 fn macos_service_file() -> Result<PathBuf> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
@@ -1047,6 +1122,8 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
+    // Keep shell child behavior deterministic under CI wrappers that set ENV/BASH_ENV.
+    command.env_remove("ENV").env_remove("BASH_ENV");
     let output = command.output().context("Failed to spawn command")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1056,6 +1133,8 @@ fn run_checked(command: &mut Command) -> Result<()> {
 }
 
 fn run_capture(command: &mut Command) -> Result<String> {
+    // Keep shell child behavior deterministic under CI wrappers that set ENV/BASH_ENV.
+    command.env_remove("ENV").env_remove("BASH_ENV");
     let output = command.output().context("Failed to spawn command")?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     if text.trim().is_empty() {
@@ -1085,7 +1164,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn run_capture_reads_stdout() {
-        let out = run_capture(Command::new("sh").args(["-lc", "echo hello"]))
+        let out = run_capture(Command::new("/bin/sh").args(["-c", "echo hello"]))
             .expect("stdout capture should succeed");
         assert_eq!(out.trim(), "hello");
     }
@@ -1093,7 +1172,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn run_capture_falls_back_to_stderr() {
-        let out = run_capture(Command::new("sh").args(["-lc", "echo warn 1>&2"]))
+        let out = run_capture(Command::new("/bin/sh").args(["-c", "echo warn 1>&2"]))
             .expect("stderr capture should succeed");
         assert_eq!(out.trim(), "warn");
     }
@@ -1101,7 +1180,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn run_checked_errors_on_non_zero_status() {
-        let err = run_checked(Command::new("sh").args(["-lc", "exit 17"]))
+        let err = run_checked(Command::new("/bin/sh").args(["-c", "exit 17"]))
             .expect_err("non-zero exit should error");
         assert!(err.to_string().contains("Command failed"));
     }
@@ -1168,7 +1247,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn is_root_matches_system_uid() {
-        assert_eq!(is_root(), unsafe { libc::getuid() == 0 });
+        assert_eq!(is_root(), current_uid() == Some(0));
     }
 
     #[test]
